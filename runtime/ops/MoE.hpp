@@ -27,10 +27,20 @@ struct MoeShape final {
   uint32_t expertFormat = GGUF_FMT_COUNT;
 
   [[nodiscard]] constexpr bool valid() const noexcept {
-    return (weightLayout == WeightLayout::Affine64 || weightLayout == WeightLayout::Block32) &&
-           hiddenSize && hiddenSize % 256 == 0 && experts && experts <= SPLASH_MOE_EXPERT_SLOTS &&
+    // GGUF blocks route up to 512 experts (Qwen3.8-Flash-Next) whose width
+    // fills 64-column tiles; affine slabs SPLASH_MOE_EXPERT_SLOTS of
+    // 256-column tiles.
+    const bool gguf = weightLayout == WeightLayout::Block32;
+    return (weightLayout == WeightLayout::Affine64 || gguf) &&
+           hiddenSize && hiddenSize % 256 == 0 && experts &&
+           experts <= (gguf ? 2 * SPLASH_MOE_EXPERT_SLOTS : SPLASH_MOE_EXPERT_SLOTS) &&
            expertsPerToken && expertsPerToken <= experts &&
-           expertIntermediateSize && expertIntermediateSize % 256 == 0;
+           expertIntermediateSize && expertIntermediateSize % (gguf ? 64u : 256u) == 0;
+  }
+  // The router's scores per row: one per thread of the select and group
+  // kernels (256, or 512 for more experts).
+  [[nodiscard]] constexpr uint32_t routerWidth() const noexcept {
+    return experts > 256 ? 512 : 256;
   }
   // Routed experts followed by the shared expert.
   [[nodiscard]] constexpr uint32_t routesPerToken() const noexcept {

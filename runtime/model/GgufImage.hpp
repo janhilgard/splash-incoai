@@ -21,6 +21,12 @@ namespace splash::model::gguf {
   return ffn == QwenFfnKind::SparseMoe ? "qwen35moe" : "qwen35";
 }
 
+// The general.architecture of a GGUF of a target of these dimensions:
+// qwen4exp for Qwen3.8-Flash-Next, else by its FFN.
+[[nodiscard]] constexpr const char *architecture(const QwenTargetDimensions &target) noexcept {
+  return target.qwen4() ? "qwen4exp" : architecture(target.ffnKind);
+}
+
 // The order of a tensor's rows in the image. Rows below `from` keep their
 // order; from there on, blocks of headRows rows are value heads, which
 // llama.cpp stores tiled (value head of its key head * keyHeads + key head)
@@ -40,6 +46,7 @@ struct TensorRows {
   uint64_t rows = 0;
   uint64_t rowBytes = 0;
   RowOrder order{};
+  uint32_t file = 0;   // the file of a split GGUF it is in
 };
 
 // Header and descriptor bytes.
@@ -50,7 +57,10 @@ struct Fill {
 // How a copy writes each value: as stored, narrowed from F32 to the bf16
 // value it equals exactly (rows the kernels read as bf16), or widened from
 // BF16 to the F32 value it equals (rows the kernels read as F32).
-enum class Conversion : uint8_t { None, NarrowToBfloat16, WidenToFloat32 };
+// DequantizeQ80: Q8_0 rows as the F32 values they equal (d * q, exact in
+// F32), for small tensors a float kernel reads, as the MTP head's injection
+// weights.
+enum class Conversion : uint8_t { None, NarrowToBfloat16, WidenToFloat32, DequantizeQ80 };
 // Rows written back to back, each value converted as `conversion` says.
 struct Copy {
   uint64_t destination = 0;
@@ -84,9 +94,29 @@ struct Image {
 // download. Throws GgufError naming every mismatch.
 void requireMetadata(const GgufMetadata &metadata, const QwenTargetDimensions &geometry);
 
-// The layers' images, then the head's and the embedding's. Checks the
-// metadata (requireMetadata) and each tensor's shape; throws GgufError naming
-// every missing tensor and every tensor of a type this build cannot load.
+// The layers' images, then the head's and the embedding's, and for qwen4exp
+// with a PLE layer the n-gram table's (ple.bin). Checks the metadata
+// (requireMetadata, and a qwen4exp file's arrays) and each tensor's shape;
+// throws GgufError naming every missing tensor and every tensor of a type
+// this build cannot load.
 [[nodiscard]] std::vector<Image> planImages(const GgufFile &file, const QwenTargetDimensions &geometry);
+
+// A qwen4exp MTP head's image (mtp.bin): its one full-attention block
+// (blk.<layers>, the block's tensors as a target layer's), then the
+// nextn tensors: eh_proj, enorm, hnorm and the head's mix. The geometry is
+// the target's; the MTP file has no PLE.
+[[nodiscard]] Image planMtpImage(const GgufFile &file, const QwenTargetDimensions &geometry);
+
+// The hash of a qwen4exp target's PLE n-gram embedding (llama.cpp
+// qwen4exp.cpp llm_graph_input_qwen4exp_ple): per n-gram position the
+// multiplier, per head its table rows' offset and count, and the table's rows.
+struct PleHash {
+  std::vector<uint64_t> multipliers;
+  std::vector<uint32_t> headOffsets;
+  std::vector<uint32_t> headVocabularies;
+  uint64_t tableRows = 0;
+  uint32_t eosToken = 0;
+};
+[[nodiscard]] PleHash readPleHash(const GgufFile &file, const QwenTargetDimensions &geometry);
 
 } // namespace splash::model::gguf

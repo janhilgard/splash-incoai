@@ -1543,9 +1543,9 @@ void blockExtents(metal::MetalBackend &backend) {
                 });
 
   // A fused projection of a 320-row Q5_K segment and a 192-row Q4_K one.
-  // Each plane is tiles of 256 rows by groups of 32 inputs, or meta units,
-  // and ends at the last row's unit of the last group: row 63 of the Q5_K
-  // segment's second tile, row 191 of the Q4_K segment's first.
+  // Each plane is tiles of QUANT_TILE_ROWS rows by groups of 32 inputs, or
+  // meta units, and ends at the last row's unit of the last group: row 319 of
+  // the Q5_K segment and row 191 of the Q4_K one, in the tile that holds it.
   const std::array segments{segmentPlanes(backend, GGUF_FMT_Q5K, 320, k),
                             segmentPlanes(backend, GGUF_FMT_Q4K, 192, k, 320)};
   const Projection fused(512, k, BlockWeights{{segments[0], segments[1]}});
@@ -1561,7 +1561,8 @@ void blockExtents(metal::MetalBackend &backend) {
     const QuantFormat &format = kQuantFormats[segments[index].formatId];
     const uint64_t groups = k / 32, units = groups / format.meta_groups;
     const auto lastUnit = [&](uint64_t blocks) {
-      return index == 0 ? (2 * blocks - 1) * 256 + 64 : (blocks - 1) * 256 + 192;
+      const uint64_t last = (index == 0 ? 320 : 192) - 1;
+      return (last / QUANT_TILE_ROWS * blocks + blocks - 1) * QUANT_TILE_ROWS + last % QUANT_TILE_ROWS + 1;
     };
     for (const auto &[member, bytes, element, name] :
          std::initializer_list<std::tuple<metal::MetalBuffer QuantizedSegment::*, uint64_t, uint64_t, const char *>>{
