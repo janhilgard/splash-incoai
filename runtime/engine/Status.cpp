@@ -70,6 +70,15 @@ const char *phaseName(engine::Phase phase) noexcept {
   }
   return "unknown";
 }
+// The API's names (server REQUEST_PRIORITIES).
+const char *priorityName(engine::RequestPriority priority) noexcept {
+  switch (priority) {
+  case engine::RequestPriority::Foreground: return "foreground";
+  case engine::RequestPriority::Normal: return "normal";
+  case engine::RequestPriority::Background: return "background";
+  }
+  return "unknown";
+}
 } // namespace
 
 std::string runtimeStatusJson(
@@ -297,11 +306,13 @@ std::string runtimeStatusJson(
       << ",\"b4\":" << scheduler.decodeBatchesByWidth[3] << "}"
       << ",\"decode_mixed_greedy_sampling_batches\":"
       << scheduler.decodeMixedGreedySamplingBatches << "}";
-  // Each live request's progress: encoded prompt tokens and generated tokens.
+  // Each live request's progress: phase, priority, encoded prompt tokens and
+  // generated tokens.
   out << ",\"active_requests\":[";
   for (size_t index = 0; index < core.activeRequests.size(); ++index) {
     const engine::ActiveRequestSnapshot &request = core.activeRequests[index];
     out << (index ? "," : "") << "{\"id\":" << request.id << ",\"phase\":\"" << phaseName(request.phase)
+        << "\",\"priority\":\"" << priorityName(request.priority)
         << "\",\"prompt_tokens\":" << request.promptTokens
         << ",\"prompt_processed\":" << request.promptProcessed
         << ",\"generated_tokens\":" << request.generatedTokens

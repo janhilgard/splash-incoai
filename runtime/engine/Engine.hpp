@@ -46,11 +46,13 @@ struct ResourceWaitSnapshot final {
   bool draining = false;
 };
 
-// One live request's progress, for /status active_requests: its phase, how
-// many prompt tokens are encoded (cached ones included) and generated.
+// One live request's progress, for /status active_requests: its phase and
+// priority, how many prompt tokens are encoded (cached ones included) and
+// generated.
 struct ActiveRequestSnapshot final {
   uint64_t id = 0;
   Phase phase = Phase::Queued;
+  RequestPriority priority = RequestPriority::Normal;
   uint32_t promptTokens = 0;
   uint32_t promptProcessed = 0;
   uint32_t generatedTokens = 0;

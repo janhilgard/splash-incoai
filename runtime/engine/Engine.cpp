@@ -330,6 +330,7 @@ EngineSnapshot Engine::snapshot() const {
     ActiveRequestSnapshot request;
     request.id = entry->first;
     request.phase = scheduler_.phase(entry->first);
+    request.priority = active.request.priority;
     request.promptTokens = active.promptTokens;
     request.promptProcessed = std::min(scheduler_.promptProcessed(entry->first), active.promptTokens);
     request.generatedTokens = active.generatedTokens;
