@@ -15,6 +15,14 @@ enum class RequestPriority : uint8_t {
   Background = 2,
 };
 
+// A score request's full-vocabulary readout at its final position, beside
+// its option logits: log-sum-exp over the vocabulary and the highest logits.
+struct ScoreReadout final {
+  double logNormalizer = 0.0;
+  std::vector<uint32_t> topIds;
+  std::vector<float> topLogits;
+};
+
 struct StepResult final {
   uint64_t requestId = 0;
   uint32_t consumedPromptTokens = 0;
@@ -68,7 +76,8 @@ public:
                              std::span<const uint32_t> simulationTokens) = 0;
   virtual void completed(uint64_t requestId, EngineFinishReason reason,
                          uint32_t promptTokens, uint32_t completionTokens,
-                         std::span<const float> optionLogits) = 0;
+                         std::span<const float> optionLogits,
+                         const ScoreReadout &score) = 0;
   virtual void failed(uint64_t requestId, std::string code, std::string message,
                       bool retryable) = 0;
   virtual void capacityExhausted(uint64_t requestId, uint32_t requiredKvPages,

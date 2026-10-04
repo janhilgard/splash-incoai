@@ -15,6 +15,8 @@ namespace {
 static_assert(protocol::kMaximumScoreOptions ==
                   model::ExecutionLimits::maximumScoreOptions,
               "native protocol and model score option bounds must match");
+static_assert(protocol::kScoreTopTokens == model::ExecutionLimits::scoreTopTokens,
+              "native protocol and model score top-token bounds must match");
 static_assert(protocol::kMinimumScoreOptions ==
                   model::ExecutionLimits::minimumScoreOptions,
               "native protocol and model score option bounds must match");
@@ -570,7 +572,8 @@ void NativeRuntime::maskRequested(uint64_t requestId,
 
 void NativeRuntime::completed(uint64_t requestId, EngineFinishReason reason,
                               uint32_t promptTokens, uint32_t completionTokens,
-                              std::span<const float> optionLogits) {
+                              std::span<const float> optionLogits,
+                              const ScoreReadout &score) {
   RequestTelemetry &telemetry = telemetry_.at(requestId);
   double now = clocks_.monotonicMilliseconds();
   double started = telemetry.startedMilliseconds > 0.0
@@ -582,7 +585,10 @@ void NativeRuntime::completed(uint64_t requestId, EngineFinishReason reason,
       durationMicros(started, first),
       telemetry.firstTokenMilliseconds ? durationMicros(first, now) : 0,
       durationMicros(telemetry.arrivedMilliseconds, now),
-      std::vector<float>(optionLogits.begin(), optionLogits.end())});
+      std::vector<float>(optionLogits.begin(), optionLogits.end()),
+      optionLogits.empty() ? 0.0 : score.logNormalizer,
+      optionLogits.empty() ? std::vector<uint32_t>{} : score.topIds,
+      optionLogits.empty() ? std::vector<float>{} : score.topLogits});
   pendingMasks_.erase(requestId);
   telemetry_.erase(requestId);
 }

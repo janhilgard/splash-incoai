@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from enum import IntEnum, IntFlag
 from typing import TypeAlias
 
-PROTOCOL_VERSION = 7
+PROTOCOL_VERSION = 8
 FRAME_HEADER_BYTES = 24
 STATUS_SCHEMA_VERSION = 5
 # Largest top-k the native sampler keeps as candidates.
@@ -23,6 +23,9 @@ MAX_TOP_K = 32
 # final-position logit per requested token, in request order.
 MIN_SCORE_TOKENS = 2
 MAX_SCORE_TOKENS = 255
+# A score DoneEvent also carries the final position's log-sum-exp over the
+# whole vocabulary and its highest logits, at most this many.
+SCORE_TOP_TOKENS = 20
 ABSOLUTE_MAX_FRAME_PAYLOAD_BYTES = 256 * 1024 * 1024
 
 _MAGIC = b"SPLH"
@@ -339,6 +342,11 @@ class DoneEvent:
     # Raw final-position logits for a score-only request, in requested token
     # order; empty for generation and for cancelled or failed scoring.
     option_logits: tuple[float, ...] = ()
+    # With option_logits only: log(sum(exp(logit))) over the whole vocabulary
+    # and the highest logits (ids and values, descending).
+    log_normalizer: float = 0.0
+    top_token_ids: tuple[int, ...] = ()
+    top_logits: tuple[float, ...] = ()
 
 
 @dataclass(slots=True, frozen=True)
@@ -555,7 +563,11 @@ def _payload_bounds(frame_type: FrameType, limits: ProtocolLimits) -> tuple[int,
         case FrameType.DONE:
             bounds = (
                 _DONE.size + 4,
-                _DONE.size + 4 + MAX_SCORE_TOKENS * 4,
+                _DONE.size
+                + 4
+                + MAX_SCORE_TOKENS * 4
+                + 12
+                + SCORE_TOP_TOKENS * 8,
             )
         case FrameType.ERROR:
             bounds = (
@@ -756,8 +768,6 @@ def _request_issue(
         generation = _u32(request.generation_prompt_tokens, "generation prompt tokens")
         if generation >= len(prompt):
             raise ValueError("generation prompt must leave a prompt token")
-        if scores and (request.image_spans or request.image_pixels):
-            raise ValueError("score requests are text-only")
         if scores and (
             len(scores) < MIN_SCORE_TOKENS
             or len(scores) > MAX_SCORE_TOKENS
@@ -1045,6 +1055,23 @@ def _done_issue(event: DoneEvent, failure: FailureClass) -> ProtocolIssue | None
                 raise ValueError(
                     "scored done events carry no completion or decode activity"
                 )
+            if (
+                isinstance(event.log_normalizer, bool)
+                or not isinstance(event.log_normalizer, (int, float))
+                or not math.isfinite(event.log_normalizer)
+            ):
+                raise ValueError("done log normalizer must be finite")
+            if type(event.top_token_ids) is not tuple or len(event.top_token_ids) > SCORE_TOP_TOKENS:
+                raise ValueError(f"done top tokens must be a tuple of at most {SCORE_TOP_TOKENS}")
+            for token in event.top_token_ids:
+                _u32(token, "done top token id")
+            top = event.top_logits
+            if type(top) is not tuple or len(top) != len(event.top_token_ids) or any(
+                not math.isfinite(_float32(value, "done top logit")) for value in top
+            ):
+                raise ValueError("done top logits must match the top tokens and be finite")
+        elif event.log_normalizer or event.top_token_ids or event.top_logits:
+            raise ValueError("only scored done events carry a normalizer or top tokens")
     except ValueError as error:
         return _issue(failure, IssueCode.INVALID_COUNT, str(error), request_id)
     return None
@@ -1281,6 +1308,12 @@ def _encode_message(
             + struct.pack("<I", len(message.option_logits))
             + _pack_floats(message.option_logits)
         )
+        if message.option_logits:
+            payload += (
+                struct.pack("<dI", float(message.log_normalizer), len(message.top_token_ids))
+                + _pack_words(message.top_token_ids)
+                + _pack_floats(message.top_logits)
+            )
         frame_type = FrameType.DONE
     elif isinstance(message, ErrorEvent):
         _raise_issue(_error_issue(message, limits, FailureClass.ENGINE_UNHEALTHY))
@@ -1659,8 +1692,23 @@ def _decode_frame(frame: Frame, limits: ProtocolLimits = ProtocolLimits()) -> Me
         values = _DONE.unpack_from(payload)
         request_id = values[0]
         score_count = struct.unpack_from("<I", payload, _DONE.size)[0]
+        normalizer, top_ids, top_logits = 0.0, (), ()
         try:
-            logits = _unpack_floats(payload, _DONE.size + 4, score_count)
+            offset = _DONE.size + 4
+            if not score_count:
+                logits = _unpack_floats(payload, offset, 0)
+            else:
+                if score_count > MAX_SCORE_TOKENS:
+                    raise ValueError("too many option logits")
+                end = offset + 4 * score_count
+                if len(payload) < end + 12:
+                    raise ValueError("score payload is truncated")
+                logits = _unpack_floats(payload[:end], offset, score_count)
+                normalizer, top_count = struct.unpack_from("<dI", payload, end)
+                if top_count > SCORE_TOP_TOKENS:
+                    raise ValueError("too many top tokens")
+                top_ids = _unpack_prefix_words(payload, end + 12, top_count)
+                top_logits = _unpack_floats(payload, end + 12 + 4 * top_count, top_count)
         except ValueError:
             _fail(
                 FailureClass.PROTOCOL_FATAL,
@@ -1679,6 +1727,9 @@ def _decode_frame(frame: Frame, limits: ProtocolLimits = ProtocolLimits()) -> Me
             ),
             *values[2:],
             logits,
+            normalizer,
+            top_ids,
+            top_logits,
         )
         _raise_issue(_done_issue(message, FailureClass.PROTOCOL_FATAL))
         return message

@@ -184,6 +184,7 @@ private:
     bool replaying = false;
     // Captured once the final prompt chunk completes; emitted with Done.
     std::vector<float> scoreLogits;
+    ScoreReadout scoreReadout;
     // A restore that could not fit alone released its prefix pin:
     // admissions ignore the cache until one succeeds.
     bool skipCache = false;
@@ -297,7 +298,7 @@ private:
   void apply(const BatchPlan &plan, std::span<const ModelStepResult> results,
              double wallMilliseconds, bool representativePrefillTiming);
   void finish(Request &request, EngineFinishReason reason,
-              std::span<const float> optionLogits);
+              std::span<const float> optionLogits, const ScoreReadout &score = {});
   void finishFailure(Request &request, Failure failure);
   void finishCapacity(Request &request, const TokenAdmission &admission);
   void release(Request &request);

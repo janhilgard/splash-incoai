@@ -125,7 +125,10 @@ std::optional<PayloadBounds> payloadBounds(FrameType type,
     }
     return bounded(kMaskRequestFixedBytes, maximum);
   case FrameType::Done:
-    if (!checkedMultiply(kMaximumScoreOptions, sizeof(float), variable) ||
+    // Option logits, then the normalizer, the top count and the top ids and
+    // logits.
+    if (!checkedMultiply(kMaximumScoreOptions + 2 * kScoreTopTokens, sizeof(float), variable) ||
+        !checkedAdd(variable, sizeof(double) + sizeof(uint32_t), variable) ||
         !checkedAdd(kDoneFixedBytes, variable, maximum)) {
       return std::nullopt;
     }
@@ -240,6 +243,7 @@ public:
   }
 
   void f32(float value) { u32(std::bit_cast<uint32_t>(value)); }
+  void f64(double value) { u64(std::bit_cast<uint64_t>(value)); }
 
   void raw(std::span<const uint8_t> bytes) {
     bytes_.insert(bytes_.end(), bytes.begin(), bytes.end());
@@ -288,6 +292,14 @@ public:
     if (!u32(bits))
       return false;
     value = std::bit_cast<float>(bits);
+    return true;
+  }
+
+  bool f64(double &value) {
+    uint64_t bits = 0;
+    if (!u64(bits))
+      return false;
+    value = std::bit_cast<double>(bits);
     return true;
   }
 
@@ -428,10 +440,8 @@ std::optional<ProtocolIssue> validateRequest(const RequestFrame &request,
                    "generation prompt must leave a prompt token");
   }
   if (scoring) {
-    if (!request.imageSpans.empty()) {
-      return invalid(IssueCode::InvalidCount,
-                     "score requests are text-only");
-    }
+    // Score requests may carry images: prefill encodes them as for
+    // generation, and only the final position's readout differs.
     if (request.scoreTokens.size() < kMinimumScoreOptions ||
         request.scoreTokens.size() > kMaximumScoreOptions) {
       return invalid(IssueCode::InvalidCount,
@@ -614,6 +624,22 @@ std::optional<ProtocolIssue> validateDone(const DoneEvent &event,
                          "done option logits must be finite");
       }
     }
+    if (!std::isfinite(event.logNormalizer) ||
+        event.topTokenIds.size() != event.topLogits.size() ||
+        event.topTokenIds.size() > kScoreTopTokens) {
+      return makeIssue(failureClass, IssueCode::InvalidCount, event.requestId,
+                       "done score normalizer or top tokens are invalid");
+    }
+    for (float logit : event.topLogits) {
+      if (!std::isfinite(logit)) {
+        return makeIssue(failureClass, IssueCode::InvalidCount, event.requestId,
+                         "done top logits must be finite");
+      }
+    }
+  } else if (event.logNormalizer != 0.0 || !event.topTokenIds.empty() ||
+             !event.topLogits.empty()) {
+    return makeIssue(failureClass, IssueCode::InvalidCount, event.requestId,
+                     "only scored done events carry a normalizer or top tokens");
   }
   return std::nullopt;
 }
@@ -842,7 +868,8 @@ ProtocolResult<Frame> encodeDone(const DoneEvent &event) {
     return failure<Frame>(std::move(*issue));
   }
   Writer writer(kDoneFixedBytes +
-                event.optionLogits.size() * sizeof(float));
+                (event.optionLogits.size() + 2 * event.topTokenIds.size()) * sizeof(float) +
+                (event.optionLogits.empty() ? 0 : sizeof(double) + sizeof(uint32_t)));
   writer.u64(event.requestId);
   writer.u8(static_cast<uint8_t>(event.reason));
   writer.u32(event.promptTokens);
@@ -853,6 +880,14 @@ ProtocolResult<Frame> encodeDone(const DoneEvent &event) {
   writer.u32(static_cast<uint32_t>(event.optionLogits.size()));
   for (float logit : event.optionLogits)
     writer.f32(logit);
+  if (!event.optionLogits.empty()) {
+    writer.f64(event.logNormalizer);
+    writer.u32(static_cast<uint32_t>(event.topTokenIds.size()));
+    for (uint32_t token : event.topTokenIds)
+      writer.u32(token);
+    for (float logit : event.topLogits)
+      writer.f32(logit);
+  }
   return success(Frame{FrameType::Done, writer.take()});
 }
 
@@ -1175,14 +1210,6 @@ ProtocolResult<Message> decodeDone(const Frame &frame) {
                   event.requestId,
                   "done option logit count exceeds its limit"));
   }
-  uint64_t logitBytes = 0;
-  if (!checkedMultiply(logitCount, sizeof(float), logitBytes) ||
-      reader.remaining() != logitBytes) {
-    return failure<Message>(makeIssue(FailureClass::ProtocolFatal,
-                                      IssueCode::InvalidPayloadLength, 0,
-                                      "done option logits do not match the "
-                                      "payload length"));
-  }
   event.optionLogits.resize(logitCount);
   for (float &logit : event.optionLogits) {
     if (!reader.f32(logit)) {
@@ -1190,6 +1217,34 @@ ProtocolResult<Message> decodeDone(const Frame &frame) {
                                         IssueCode::InvalidPayloadLength, 0,
                                         "done option logits are truncated"));
     }
+  }
+  if (logitCount) {
+    uint32_t topCount = 0;
+    if (!reader.f64(event.logNormalizer) || !reader.u32(topCount)) {
+      return failure<Message>(makeIssue(FailureClass::ProtocolFatal,
+                                        IssueCode::InvalidPayloadLength, 0,
+                                        "done score normalizer is truncated"));
+    }
+    if (topCount > kScoreTopTokens) {
+      return failure<Message>(makeIssue(FailureClass::ProtocolFatal, IssueCode::LimitExceeded,
+                                        event.requestId, "done top token count exceeds its limit"));
+    }
+    event.topTokenIds.resize(topCount);
+    event.topLogits.resize(topCount);
+    for (uint32_t &token : event.topTokenIds)
+      if (!reader.u32(token))
+        return failure<Message>(makeIssue(FailureClass::ProtocolFatal, IssueCode::InvalidPayloadLength,
+                                          0, "done top tokens are truncated"));
+    for (float &logit : event.topLogits)
+      if (!reader.f32(logit))
+        return failure<Message>(makeIssue(FailureClass::ProtocolFatal, IssueCode::InvalidPayloadLength,
+                                          0, "done top logits are truncated"));
+  }
+  if (reader.remaining() != 0) {
+    return failure<Message>(makeIssue(FailureClass::ProtocolFatal,
+                                      IssueCode::InvalidPayloadLength, 0,
+                                      "done option logits do not match the "
+                                      "payload length"));
   }
   event.reason = static_cast<FinishReason>(reason);
   if (auto issue = validateDone(event, FailureClass::ProtocolFatal)) {

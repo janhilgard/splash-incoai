@@ -15,22 +15,22 @@ ROOT = Path(__file__).parents[3]
 
 
 REQUEST_GOLDEN = (
-    "53504c4807001800010000005c0000000000000000000000efcdab8967452301"
+    "53504c4808001800010000005c0000000000000000000000efcdab8967452301"
     "000201008098281765060040a5ae0200000000008000000500000000000000cd"
     "cc4c3f3333733f200000001032547698badcfe00000000000200000000000000"
     "00000000010000002a00000000000080ffffffff"
 )
 ERROR_GOLDEN = (
-    "53504c4807001800050100002700000000000000000000000200000000000000"
+    "53504c4808001800050100002700000000000000000000000200000000000000"
     "0000090000000c0000006770755f6661756c744d6574616c206661696c6564"
 )
 STATUS_GOLDEN = (
-    "53504c4807001800070100002d00000000000000000000002803000000000000"
+    "53504c4808001800070100002d00000000000000000000002803000000000000"
     "050000007b22736368656d615f76657273696f6e223a342c227265616479223a"
     "747275657d"
 )
 INITIAL_MASK_GOLDEN = (
-    "53504c4807001800030100001800000000000000000000005b00000000000000"
+    "53504c4808001800030100001800000000000000000000005b00000000000000"
     "06000000000000000400000000000000"
 )
 
@@ -575,9 +575,10 @@ class ProtocolPythonTests(unittest.TestCase):
             mutate_u32(wire, 24 + 13, 1),
             mutate_u64(wire, 24 + 25, 1),
         )
-        # A wire-consistent count below the score minimum.
-        one_logit = wire[: 24 + 49]
-        one_logit = mutate_u64(one_logit, 12, 49)
+        # A wire-consistent count below the score minimum (one logit, then the
+        # normalizer and an empty top list).
+        one_logit = wire[: 24 + 49] + struct.pack("<dI", 0.0, 0)
+        one_logit = mutate_u64(one_logit, 12, 61)
         one_logit = mutate_u32(one_logit, 24 + 41, 1)
         mutations += (one_logit, mutate_u32(wire, 24 + 45, 0x7FC00000))
         for mutated in mutations:
@@ -587,6 +588,43 @@ class ProtocolPythonTests(unittest.TestCase):
                     p.IssueCode.INVALID_COUNT,
                     lambda mutated=mutated: p.decode_frame(parse_all(mutated)[0]),
                 )
+
+    def test_done_score_readout_roundtrips_and_validates(self):
+        done = p.DoneEvent(
+            91, p.FinishReason.STOP, 4096, 0, 1000, 0, 3500, (1.5, -2.25),
+            12.75, (7, 3, 11), (9.5, 9.25, -1.0),
+        )
+        wire = p.serialize_message(done)
+        # Option logits, then the f64 normalizer, the top count, ids, logits.
+        self.assertEqual(struct.unpack_from("<dI", wire, 24 + 45 + 8), (12.75, 3))
+        self.assertEqual(struct.unpack_from("<3I", wire, 24 + 45 + 20), (7, 3, 11))
+        self.assertEqual(struct.unpack_from("<3f", wire, 24 + 45 + 32), (9.5, 9.25, -1.0))
+        self.assertEqual(p.decode_frame(parse_all(wire)[0]), done)
+        # Generation done events stay byte-identical: no readout follows.
+        plain = p.DoneEvent(92, p.FinishReason.STOP, 10, 3, 100, 200, 400)
+        self.assertEqual(len(p.serialize_message(plain)), 24 + 45)
+        base = dict(request_id=91, reason=p.FinishReason.STOP, prompt_tokens=4,
+                    completion_tokens=0, prefill_micros=1, decode_micros=0, wall_micros=2)
+        for fields in (
+            dict(option_logits=(1.0, 2.0), log_normalizer=float("nan")),
+            dict(option_logits=(1.0, 2.0), top_token_ids=(1,), top_logits=()),
+            dict(option_logits=(1.0, 2.0), top_token_ids=tuple(range(21)),
+                 top_logits=tuple(0.0 for _ in range(21))),
+            dict(option_logits=(1.0, 2.0), top_token_ids=(1,), top_logits=(float("inf"),)),
+            dict(log_normalizer=1.0),
+            dict(top_token_ids=(1,), top_logits=(0.0,)),
+        ):
+            with self.subTest(fields=fields):
+                with self.assertRaises(p.ProtocolError):
+                    p.serialize_message(p.DoneEvent(**base, **fields))
+        # Trailing bytes after the readout fail closed.
+        trailing = wire + b"\0\0\0\0"
+        trailing = mutate_u64(trailing, 12, len(trailing) - 24)
+        self.assert_protocol_error(
+            p.FailureClass.PROTOCOL_FATAL,
+            p.IssueCode.INVALID_PAYLOAD_LENGTH,
+            lambda: p.decode_frame(parse_all(trailing)[0]),
+        )
 
     def test_done_option_logits_validation(self):
         base = dict(

@@ -24,7 +24,7 @@ from transformers import AutoTokenizer
 
 if __package__:
     from . import images as image_input
-    from . import json_codec, judgments
+    from . import json_codec, judgments, scoring
     from . import runtime as engine_runtime
     from .api_shapes import (
         anthropic_response,
@@ -69,6 +69,7 @@ else:
     import images as image_input
     import json_codec
     import judgments
+    import scoring
     from api_shapes import (
         anthropic_response,
         anthropic_stop,
@@ -355,6 +356,7 @@ class FrontendHandler(BaseHTTPRequestHandler):
                     "message": error.message,
                     "type": error_type,
                     "code": error.code,
+                    **({"details": error.details} if error.details is not None else {}),
                 }
             },
         )
@@ -563,6 +565,7 @@ class FrontendHandler(BaseHTTPRequestHandler):
             "/apply-template",
             "/v1/judgments",
             "/v1/systemone",
+            "/v1/score",
         ):
             self._safe_error(APIError(404, "not found", "not_found"))
             return
@@ -639,6 +642,9 @@ class FrontendHandler(BaseHTTPRequestHandler):
                 return
             if systemone:
                 self._systemone(body, deadline)
+                return
+            if path == "/v1/score":
+                self._score(body, deadline, started_at)
                 return
             responses = path == "/v1/responses"
             stream = body.get("stream", False)
@@ -777,6 +783,90 @@ class FrontendHandler(BaseHTTPRequestHandler):
             200,
             judgments.judgment_response(self.app.model, row, job.meta, result),
         )
+
+    def _score(self, body, deadline, started_at):
+        """POST /v1/score: one request, or a batch under "requests" whose jobs
+        run concurrently through the scheduler (scoring.py)."""
+        batched = "requests" in body
+        if batched:
+            unknown = sorted(set(body) - scoring.BATCH_FIELDS)
+            if unknown:
+                raise APIError(400, f"unsupported fields: {', '.join(unknown)}")
+            items = body["requests"]
+            if (
+                not isinstance(items, list)
+                or not items
+                or len(items) > scoring.MAX_BATCH_REQUESTS
+                or any(not isinstance(item, dict) for item in items)
+            ):
+                raise APIError(
+                    400,
+                    "requests must be an array of 1 to "
+                    f"{scoring.MAX_BATCH_REQUESTS} request objects",
+                )
+            shared = {key: body[key] for key in ("model", "priority") if key in body}
+            bodies = [{**shared, **item} for item in items]
+        else:
+            bodies = [body]
+        jobs = []
+        try:
+            for index, item in enumerate(bodies):
+                jobs.append(
+                    self.app.prepare_score(
+                        item, deadline=deadline, index=index if batched else None
+                    )
+                )
+            remaining_request_time(deadline)
+            if self._client_disconnected():
+                raise ConnectionResetError("client disconnected before submission")
+            submitted = []
+            for job in jobs:
+                if not self.app.backend.submit(job):
+                    raise _queue_full()
+                submitted.append(job)
+            results = [self._score_result(job) for job in jobs]
+        except BaseException:
+            for job in jobs:
+                self.app.backend.cancel(job)
+            raise
+        responses = []
+        for job, result in zip(jobs, results):
+            cached = job.cache.matched_tokens
+            prefill = result.start_to_first_token_ms
+            total = result.request_wall_ms
+            responses.append(
+                scoring.score_response(
+                    self.app.model,
+                    job.meta["labels"],
+                    job.score_tokens,
+                    job.meta["options"],
+                    result,
+                    tokenizer=self.app.tokenizer,
+                    cached_tokens=cached,
+                    queue_ms=max(0.0, total - prefill),
+                )
+            )
+            self.app.record_score(result.prompt_tokens, cached, total / 1000.0)
+        self._json(
+            200,
+            {"object": "list", "data": responses} if batched else responses[0],
+        )
+
+    def _score_result(self, job):
+        result = None
+        while result is None:
+            kind, value = self._next_event(job)
+            if kind == "done":
+                result = value
+        if result.reason == "cancelled":
+            if job.timed_out:
+                raise APIError(504, "request timed out", "request_timeout")
+            raise APIError(500, "request cancelled", "request_cancelled")
+        if result.reason != "stop" or len(result.option_logits) != len(
+            job.score_tokens
+        ):
+            raise APIError(500, "runtime protocol error", "protocol_error")
+        return result
 
     def _systemone(self, body, deadline):
         active_job = None

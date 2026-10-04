@@ -72,7 +72,7 @@ void Engine::submit(EngineRequest value) {
   const uint64_t id = value.id;
   if (scoring) {
     if (value.cohort != BatchCohort::Greedy ||
-        value.constraint != ConstraintMode::None || !value.images.empty() ||
+        value.constraint != ConstraintMode::None ||
         value.sampling.temperature != 0.0f || value.sampling.topP != 1.0f ||
         value.sampling.topK != 0 ||
         value.scoreTokens.size() < model::ExecutionLimits::minimumScoreOptions ||
@@ -1382,6 +1382,7 @@ void Engine::apply(const BatchPlan &plan,
         throw std::logic_error("model returned mismatched score logits");
       }
       active.scoreLogits = result.scoreLogits;
+      active.scoreReadout = {result.scoreLogNormalizer, result.scoreTopIds, result.scoreTopLogits};
     }
     // Score requests carry maxNewTokens == 0; only the model's finished flag
     // on the final prompt chunk completes them.
@@ -1421,13 +1422,13 @@ void Engine::apply(const BatchPlan &plan,
     } else if (schedulerResults[index].finished) {
       finish(active, result.finished ? EngineFinishReason::Stop
                                      : EngineFinishReason::Length,
-             active.scoreLogits);
+             active.scoreLogits, active.scoreReadout);
     }
   }
 }
 
 void Engine::finish(Request &active, EngineFinishReason reason,
-                    std::span<const float> optionLogits) {
+                    std::span<const float> optionLogits, const ScoreReadout &score) {
   if (active.restore) {
     if (!active.failure) active.failure = Failure{"cancelled", "request cancelled"};
     if (active.restore->ticket) active.restore->ticket->cancel();
@@ -1445,7 +1446,7 @@ void Engine::finish(Request &active, EngineFinishReason reason,
                                   active.promptTokens)
           : 0;
   events_.completed(active.request.id, reason, active.promptTokens,
-                    completionTokens, optionLogits);
+                    completionTokens, optionLogits, score);
   if (reason == EngineFinishReason::Cancelled) {
     ++counters_.cancelled;
   } else {

@@ -287,6 +287,8 @@ class Plan:
         after_terminal=False,
         matched_tokens=1,
         logits=None,
+        normalizer=0.0,
+        top=(),
     ):
         self.batches = list(batches)
         self.reason = reason
@@ -295,6 +297,8 @@ class Plan:
         self.delay = delay
         self.matched_tokens = matched_tokens
         self.logits = logits
+        self.normalizer = normalizer
+        self.top = tuple(top)
         self.started = threading.Event()
         self.release = threading.Event()
         if not block:
@@ -496,6 +500,9 @@ class FakeRuntime:
             2_000,
             3_000,
             tuple(plan.logits) if plan.logits is not None else (),
+            float(plan.normalizer) if plan.logits is not None else 0.0,
+            tuple(token for token, _ in plan.top) if plan.logits is not None else (),
+            tuple(float(value) for _, value in plan.top) if plan.logits is not None else (),
         )
         call.complete(
             result=api.engine_runtime.GenerationResult(call.request_id, None, done)
@@ -1391,6 +1398,176 @@ class ServerTest(unittest.TestCase):
             harness.tokenizer.encode(prompt_text + "A"),
             list(request.prompt_tokens) + [ord("A")],
         )
+
+    class ScoreTokenizer(CharTokenizer):
+        """Character tokens through every entry point Chat and /v1/score use."""
+
+        def __call__(self, text, **kwargs):
+            return {"input_ids": self.encode(text)}
+
+        def __len__(self):
+            return 0x110000
+
+    def score_body(self, **overrides):
+        body = {
+            "messages": [
+                {"role": "system", "content": "Judge products."},
+                {"role": "user", "content": "Same item?"},
+            ],
+            "assistant_prefix": '{"same":',
+            "labels": ["T", "F"],
+            "reasoning_effort": "none",
+        }
+        body.update(overrides)
+        return body
+
+    def test_score_reads_labels_after_the_chat_prompt_and_prefix(self):
+        top = ((ord("T"), 2.0), (ord("x"), 1.0), (ord("F"), 0.5))
+        runtime = FakeRuntime(
+            Plan(logits=(2.0, 0.5), normalizer=3.0, top=top, matched_tokens=5),
+            Plan([[ord("x")]]),
+        )
+        harness = self.harness(runtime, tokenizer=self.ScoreTokenizer(), max_context=8192)
+        status, content_type, payload = harness.request(
+            "POST", "/v1/score", self.score_body(return_top_k=2)
+        )
+        self.assertEqual(status, 200, payload)
+        self.assertEqual(content_type, "application/json")
+        response = json.loads(payload)
+        self.assertEqual(response["object"], "score")
+        self.assertEqual(response["argmax"], "T")
+        labels = response["labels"]
+        self.assertEqual([entry["label"] for entry in labels], ["T", "F"])
+        self.assertEqual([entry["token_id"] for entry in labels], [ord("T"), ord("F")])
+        # Full-vocabulary log probabilities subtract the native normalizer.
+        self.assertAlmostEqual(labels[0]["logprob"], 2.0 - 3.0)
+        self.assertAlmostEqual(labels[1]["logprob"], 0.5 - 3.0)
+        self.assertAlmostEqual(labels[0]["prob"] + labels[1]["prob"], 1.0)
+        self.assertAlmostEqual(
+            labels[0]["prob"], math.exp(2.0) / (math.exp(2.0) + math.exp(0.5))
+        )
+        self.assertAlmostEqual(response["label_mass"], math.exp(-1.0) + math.exp(-2.5))
+        self.assertEqual(
+            [entry["token"] for entry in response["top_k"]], ["T", "x"]
+        )
+        self.assertAlmostEqual(response["top_k"][1]["logprob"], -2.0)
+        self.assertEqual(response["usage"]["cached_tokens"], 5)
+        self.assertEqual(set(response["timing"]), {"queue_ms", "prefill_ms", "total_ms"})
+
+        request = runtime.requests[0]
+        # The engine scores the Chat prompt followed by the prefix, prefill only.
+        text = harness.tokenizer.decode(request.prompt_tokens)
+        self.assertTrue(text.endswith('</think>\n\n{"same":'), text)
+        self.assertEqual(request.score_tokens, (ord("T"), ord("F")))
+        self.assertEqual(request.logical_max_output_tokens, 0)
+        # Reusable state stays before the assistant turn: Chat's generation
+        # prompt plus the prefix, or unknown (0) where Chat's is unknown.
+        chat = self.score_body()
+        for key in ("assistant_prefix", "labels"):
+            chat.pop(key)
+        status, _, payload = harness.request(
+            "POST", "/v1/chat/completions", {**chat, "max_tokens": 1}
+        )
+        self.assertEqual(status, 200, payload)
+        generation = runtime.requests[1].generation_prompt_tokens
+        self.assertEqual(
+            request.generation_prompt_tokens,
+            generation + len('{"same":') if generation else 0,
+        )
+        self.assertEqual(
+            list(runtime.requests[1].prompt_tokens),
+            list(request.prompt_tokens[: -len('{"same":')]),
+        )
+        status, _, payload = harness.request("GET", "/status")
+        score = json.loads(payload)["score"]
+        self.assertEqual(score["score_requests"], 1)
+        self.assertEqual(score["score_cached_tokens"], 5)
+        self.assertEqual(score["score_prompt_tokens"], len(request.prompt_tokens))
+
+    def test_score_temperature_scales_only_label_probabilities(self):
+        runtime = FakeRuntime(Plan(logits=(2.0, 0.5), normalizer=3.0))
+        harness = self.harness(runtime, tokenizer=self.ScoreTokenizer(), max_context=8192)
+        status, _, payload = harness.request(
+            "POST", "/v1/score", self.score_body(temperature=2.0)
+        )
+        self.assertEqual(status, 200, payload)
+        labels = json.loads(payload)["labels"]
+        self.assertAlmostEqual(
+            labels[0]["prob"], math.exp(1.0) / (math.exp(1.0) + math.exp(0.25))
+        )
+        self.assertAlmostEqual(labels[0]["logprob"], -1.0)
+
+    def test_score_label_token_ids_override_labels(self):
+        runtime = FakeRuntime(Plan(logits=(0.0, 1.0, -1.0), normalizer=2.0))
+        harness = self.harness(runtime, tokenizer=self.ScoreTokenizer(), max_context=8192)
+        status, _, payload = harness.request(
+            "POST",
+            "/v1/score",
+            self.score_body(labels=None, label_token_ids=[65, 66, 67]),
+        )
+        self.assertEqual(status, 200, payload)
+        response = json.loads(payload)
+        self.assertEqual(response["argmax"], "B")
+        self.assertEqual(runtime.requests[0].score_tokens, (65, 66, 67))
+
+    def test_score_rejects_a_multi_token_label_with_its_tokens(self):
+        runtime = FakeRuntime()
+        harness = self.harness(runtime, tokenizer=self.ScoreTokenizer(), max_context=8192)
+        status, _, payload = harness.request(
+            "POST", "/v1/score", self.score_body(labels=[" true", "F"])
+        )
+        self.assertEqual(status, 400, payload)
+        error = json.loads(payload)["error"]
+        self.assertIn("exactly one token", error["message"])
+        detail = error["details"]["labels"][0]
+        self.assertEqual(detail["label"], " true")
+        self.assertEqual([token["text"] for token in detail["tokens"]], list(" true"))
+        self.assertEqual(runtime.requests, [])
+
+    def test_score_rejects_invalid_requests_before_inference(self):
+        runtime = FakeRuntime()
+        harness = self.harness(runtime, tokenizer=self.ScoreTokenizer(), max_context=8192)
+        for overrides, fragment in (
+            ({"labels": ["T"]}, "at least two"),
+            ({"labels": ["T", "T"]}, "distinct"),
+            ({"labels": None}, "labels or label_token_ids"),
+            ({"temperature": 0}, "temperature"),
+            ({"return_top_k": 21}, "return_top_k"),
+            ({"stream": True}, "unsupported fields"),
+            ({"assistant_prefix": 3}, "assistant_prefix"),
+            ({"reasoning_effort": "high"}, "think block"),
+        ):
+            with self.subTest(overrides=overrides):
+                status, _, payload = harness.request(
+                    "POST", "/v1/score", self.score_body(**overrides)
+                )
+                self.assertEqual(status, 400, payload)
+                self.assertIn(fragment, json.loads(payload)["error"]["message"])
+        self.assertEqual(runtime.requests, [])
+
+    def test_score_batch_runs_every_request_and_keeps_order(self):
+        runtime = FakeRuntime(
+            Plan(logits=(1.0, 0.0), normalizer=2.0),
+            Plan(logits=(0.0, 1.0), normalizer=2.0),
+            Plan(logits=(3.0, 0.0), normalizer=4.0),
+        )
+        harness = self.harness(runtime, tokenizer=self.ScoreTokenizer(), max_context=8192)
+        items = [
+            {k: v for k, v in self.score_body().items() if k != "model"}
+            for _ in range(3)
+        ]
+        items[1]["messages"] = [{"role": "user", "content": "Other candidate?"}]
+        status, _, payload = harness.request("POST", "/v1/score", {"requests": items})
+        self.assertEqual(status, 200, payload)
+        response = json.loads(payload)
+        self.assertEqual(response["object"], "list")
+        self.assertEqual([entry["argmax"] for entry in response["data"]], ["T", "F", "T"])
+        self.assertEqual(len(runtime.requests), 3)
+        status, _, payload = harness.request(
+            "POST", "/v1/score", {"requests": [{"labels": ["T"]}]}
+        )
+        self.assertEqual(status, 400, payload)
+        self.assertIn("requests[0].", json.loads(payload)["error"]["message"])
 
     def test_judgments_rejects_invalid_rows_before_inference(self):
         runtime = FakeRuntime()

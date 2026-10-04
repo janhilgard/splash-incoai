@@ -14,7 +14,7 @@ from pathlib import Path
 
 if __package__:
     from . import images as image_input
-    from . import json_codec, judgments
+    from . import json_codec, judgments, scoring
     from . import protocol as wire
     from .api_shapes import (
         IMAGE_PAD_TOKEN,
@@ -51,6 +51,7 @@ else:
     import images as image_input
     import json_codec
     import judgments
+    import scoring
     import protocol as wire
     from api_shapes import (
         IMAGE_PAD_TOKEN,
@@ -279,6 +280,13 @@ class Frontend:
         # tokenizer's own.
         self.chat_templates = chat_templates
         self.prompt_tokenizer = PromptTokenizer(tokenizer)
+        # /v1/score counters for /status; latency lives in status latency.
+        self.score_lock = threading.Lock()
+        self.score_stats = {
+            "score_requests": 0,
+            "score_prompt_tokens": 0,
+            "score_cached_tokens": 0,
+        }
         self.backend = backend
         self.model = model
         self.model_names = tuple(
@@ -328,6 +336,8 @@ class Frontend:
                 "active": self.preparation_active,
                 "waiting": self.preparation_waiting,
             }
+        with self.score_lock:
+            status["score"] = dict(self.score_stats)
         status["grammar_cache"] = self.constraint_factory.stats()
         status["response_store"] = self.response_store.stats()
         status["image_cache"] = self.images.stats()
@@ -685,6 +695,94 @@ class Frontend:
                 },
             )
         return job, body
+
+    def record_score(self, prompt_tokens, cached_tokens, seconds):
+        """Count one completed /v1/score request and its latency."""
+        with self.score_lock:
+            self.score_stats["score_requests"] += 1
+            self.score_stats["score_prompt_tokens"] += prompt_tokens
+            self.score_stats["score_cached_tokens"] += cached_tokens
+        self.latencies.observe("score_request", seconds)
+
+    def prepare_score(self, body, *, deadline=None, index=None):
+        """A /v1/score request: its messages rendered exactly as Chat renders
+        them, the assistant prefix after the generation prompt, and its
+        labels' single tokens in that position (scoring.py)."""
+        try:
+            options = scoring.validate_options(body, index=index)
+        except scoring.ScoreRequestError as error:
+            raise APIError(400, str(error)) from error
+        if deadline is None:
+            deadline = self.request_deadline(body)
+        priority = self._priority(body)
+        with self._preparation(deadline):
+            prompt = self._prepare_prompt(body, deadline=deadline)
+            rendered = self._render_prompt(prompt, deadline)
+            if rendered.thinking:
+                raise APIError(
+                    400,
+                    "scoring reads the answer after the reasoning block; the "
+                    "rendered prompt opens a think block, so set "
+                    '"reasoning_effort": "none"',
+                )
+            text = rendered.text + options.assistant_prefix
+            ids = list(rendered.tokens)
+            if options.assistant_prefix:
+                with self.latencies.measure("tokenization"):
+                    extended = list(self.prompt_tokenizer.encode(text))
+                if extended[: len(ids)] != ids or len(extended) == len(ids):
+                    raise APIError(
+                        400,
+                        "assistant_prefix changes the tokenization of the prompt "
+                        "before it or adds no token",
+                    )
+                ids = extended
+            prefix_tokens = len(ids) - len(rendered.tokens)
+            remaining_request_time(deadline)
+            try:
+                with self.latencies.measure("tokenization"):
+                    labels, token_ids = scoring.resolve_labels(
+                        self.tokenizer,
+                        self.prompt_tokenizer.encode,
+                        text,
+                        ids,
+                        options,
+                        len(self.tokenizer),
+                    )
+            except scoring.ScoreRequestError as error:
+                raise APIError(400, str(error), details=error.details) from error
+            image_spans, image_pixels = (), b""
+            if rendered.images:
+                ids, image_spans, image_pixels = self._expand_image_pads(
+                    ids, rendered.images, rendered.image_positions
+                )
+            if len(ids) > self.max_context:
+                raise ContextLengthError(len(ids), self.max_context)
+            remaining_request_time(deadline)
+            job = Job(
+                request_id=next(self.ids),
+                prompt_tokens=ids,
+                max_new_tokens=0,
+                seed=0,
+                temperature=0.0,
+                top_p=1.0,
+                top_k=0,
+                deadline=deadline,
+                priority=priority,
+                score_tokens=tuple(token_ids),
+                image_spans=image_spans,
+                image_pixels=image_pixels,
+                image_owner=rendered.images if rendered.images else None,
+                # Reusable state stays before the assistant turn, as for Chat.
+                generation_prompt_tokens=(
+                    rendered.generation_prompt_tokens + prefix_tokens
+                    if rendered.generation_prompt_tokens
+                    else 0
+                ),
+                public_id=secrets.token_hex(16),
+                meta={"labels": labels, "options": options},
+            )
+        return job
 
     def prepare_systemone(self, body, *, deadline=None):
         details = []

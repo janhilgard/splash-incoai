@@ -2,11 +2,14 @@ from __future__ import annotations
 
 
 class APIError(Exception):
-    def __init__(self, status, message, code="invalid_request_error"):
+    def __init__(self, status, message, code="invalid_request_error", *, details=None):
         super().__init__(message)
         self.status = status
         self.message = message
         self.code = code
+        # Optional structured detail an OpenAI-shaped error body carries as
+        # error.details (for example a label's token breakdown).
+        self.details = details
 
     def protocol_type(self, anthropic=False):
         if not anthropic:

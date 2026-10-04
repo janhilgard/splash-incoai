@@ -274,7 +274,8 @@ void testScoreRequestAndDoneLogits() {
   withImage.imageSpans = {
       {0, 1, 2, 2, 0x1111222233334444ULL, 0x5555666677778888ULL}};
   withImage.imagePixels.resize(withImage.imageSpans[0].pixelBytes());
-  expectRequestIssue(withImage, IssueCode::InvalidCount);
+  // Score requests may carry images: prefill encodes them as for generation.
+  CHECK(test, roundTrip(withImage) == withImage);
 
   RequestFrame constrained = request;
   constrained.constraint = ConstraintMode::TokenMask;
@@ -292,9 +293,30 @@ void testScoreRequestAndDoneLogits() {
   auto encodedDone = serializeMessage(Message{scored});
   CHECK(test, encodedDone);
   if (encodedDone) {
-    CHECK(test, encodedDone.value->size() == kFrameHeaderBytes + 45 + 12);
+    // 3 option logits, the f64 normalizer and an empty top count.
+    CHECK(test, encodedDone.value->size() == kFrameHeaderBytes + 45 + 12 + 12);
     CHECK(test, loadU32(*encodedDone.value, kFrameHeaderBytes + 41) == 3);
   }
+
+  // The full-vocabulary readout round-trips; generation stays readout-free.
+  DoneEvent readout = scored;
+  readout.logNormalizer = 12.75;
+  readout.topTokenIds = {7, 3, 11};
+  readout.topLogits = {9.5f, 9.25f, -1.0f};
+  CHECK(test, roundTrip(readout) == readout);
+  auto encodedReadout = serializeMessage(Message{readout});
+  CHECK(test, encodedReadout && encodedReadout.value->size() == kFrameHeaderBytes + 45 + 12 + 12 + 24);
+  DoneEvent badNormalizer = readout;
+  badNormalizer.logNormalizer = std::numeric_limits<double>::quiet_NaN();
+  DoneEvent mismatchedTop = readout;
+  mismatchedTop.topLogits.pop_back();
+  DoneEvent tooManyTop = readout;
+  tooManyTop.topTokenIds.assign(kScoreTopTokens + 1, 1);
+  tooManyTop.topLogits.assign(kScoreTopTokens + 1, 0.0f);
+  DoneEvent unscoredReadout{91, FinishReason::Length, 10, 4, 1, 2, 3, {}};
+  unscoredReadout.logNormalizer = 1.0;
+  for (const DoneEvent &invalid : {badNormalizer, mismatchedTop, tooManyTop, unscoredReadout})
+    CHECK(test, !encodeMessage(Message{invalid}));
 
   DoneEvent generation{91, FinishReason::Length, 10, 4, 1, 2, 3, {}};
   CHECK(test, roundTrip(generation) == generation);

@@ -38,6 +38,7 @@ STAGES = (
     "native_queue",
     "ttft",
     "output_interval",
+    "score_request",
 )
 
 

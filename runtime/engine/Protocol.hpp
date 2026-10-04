@@ -14,7 +14,7 @@
 
 namespace splash::protocol {
 
-inline constexpr uint16_t kProtocolVersion = 7;
+inline constexpr uint16_t kProtocolVersion = 8;
 inline constexpr size_t kFrameHeaderBytes = 24;
 inline constexpr uint32_t kStatusSchemaVersion = 5;
 // Image pixels travel inside the request frame; a multi-image agent turn can
@@ -119,6 +119,11 @@ struct ProtocolLimits {
 // the wire contract; the engine additionally requires vocabulary bounds.
 inline constexpr uint32_t kMinimumScoreOptions = 2;
 inline constexpr uint32_t kMaximumScoreOptions = 255;
+// A score DoneEvent also carries the final position's log-sum-exp over the
+// whole vocabulary and its kScoreTopTokens highest logits (ids and values,
+// in descending order), so a client can read full-vocabulary log
+// probabilities and the probability mass of its options.
+inline constexpr uint32_t kScoreTopTokens = 20;
 
 enum class RequestPriority : uint8_t {
   Foreground = 0,
@@ -314,6 +319,11 @@ struct DoneEvent {
   // Raw final-prompt-position logits at the request's scoreTokens, in
   // requested order. Empty for generation and for cancelled/failed scoring.
   std::vector<float> optionLogits{};
+  // With optionLogits only: log(sum(exp(logit))) over the whole vocabulary at
+  // that position, and its highest logits (at most kScoreTopTokens).
+  double logNormalizer = 0.0;
+  std::vector<uint32_t> topTokenIds{};
+  std::vector<float> topLogits{};
 
   bool operator==(const DoneEvent &) const = default;
 };
