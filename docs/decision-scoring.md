@@ -53,24 +53,35 @@ readout.
    one token. The same check is used for `/v1/judgments` answer slots. A
    failing label gets a 400 with its token breakdown. `label_token_ids`
    bypasses the text check.
-4. **Scheduling.** A score job goes through the same scheduler as any prefill:
+4. **Batch invariance.** A prefill command that contains a score request runs
+   its projections split-free (`QwenTargetPrefillBuffers::splitFree`,
+   `ops::LinearWorkload::splitFree`). Chunks of up to 32 rows use the decode
+   tile with a single K pass, whose outputs equal the large prefill tile's bit
+   for bit. Without this, a K split reorders fp32 sums in small chunks. Small
+   chunks are packed batches and cache-resumed suffixes, and in a MoE model a
+   reordered sum can flip an expert choice. Measured on 35B, the same request
+   alone and packed then differed by up to 0.63 in a label logit (0.09 in
+   probability). Split-free, its logits are bit-identical alone, packed with
+   up to 24 others, and cold or warm in the prefix cache. Prefill commands
+   without a score request keep their plans, so Chat's numerics do not change.
+5. **Scheduling.** A score job goes through the same scheduler as any prefill:
    priorities, prefill packing and decode share. It never decodes and never
    drafts, so MTP/DFlash do not run. It releases its lane when its prefill
    ends.
-5. **Images.** Images are allowed. Score requests were text-only before;
+6. **Images.** Images are allowed. Score requests were text-only before;
    prefill encodes images the same way for scoring as for generation.
-6. **Cache.** The job's `generation_prompt_tokens` is Chat's generation prompt
+7. **Cache.** The job's `generation_prompt_tokens` is Chat's generation prompt
    plus the prefix tokens. Its reusable state therefore stays before the
    assistant turn, where a Chat request with the same messages or another
    score request with a different prefix resumes.
-7. **Readout math (server).**
+8. **Readout math (server).**
    - `logprob` = logit − log_normalizer: full-vocabulary log-softmax at T = 1,
      no penalties.
    - `prob` = softmax over the labels' logits / `temperature`.
    - `label_mass` = Σ exp(logprob) over the labels.
    - `argmax` = the label with the highest logit.
    - `top_k` = the first `return_top_k` (at most 20) of the native top tokens.
-8. **Counters.** `/status` gains `score.score_requests`,
+9. **Counters.** `/status` gains `score.score_requests`,
    `score.score_prompt_tokens` and `score.score_cached_tokens`, and
    `latency.score_request` is a latency histogram.
 
@@ -166,10 +177,58 @@ together. Prompts that share their beginning, such as our product against
 later requests wait for the first one's state there (`waiting_prefix`). The
 response is `{"object": "list", "data": [ ...one score result per request ]}`.
 
+### `POST /v1/decisions`
+
+Several single-token questions over one shared input. Each question becomes a
+score request whose user message is the input followed by the question. The
+input's tokens are therefore a common prefix the cache computes once.
+- `yes_no` asks for one word, yes or no.
+- `choice` lists its options as letters A–H.
+- `score` lists its levels as 0–9.
+
+```bash
+curl -s http://127.0.0.1:8001/v1/decisions -H "Authorization: Bearer $SPLASH_API_KEY" \
+  -H 'Content-Type: application/json' -d '{
+  "system": "You classify product listings.",
+  "input": "Listing: Bosch GSR 12V-15 Professional cordless drill, 2x 2.0 Ah battery, charger, case",
+  "reasoning_effort": "none",
+  "questions": {
+    "is_tool": {"type": "yes_no", "question": "Is it a power tool?"},
+    "category": {"type": "choice", "question": "Which category fits best?",
+                 "options": ["accessory", "drill", "battery", "charger"]},
+    "completeness": {"type": "score", "question": "How complete is the listing?",
+                     "levels": ["poor", "fair", "good"]}
+  }
+}'
+```
+
+```json
+{"object": "decisions", "model": "...",
+ "answers": {
+  "is_tool": {"type": "yes_no", "answer": "yes", "p_yes": 0.998,
+              "probabilities": {"yes": 0.998, "no": 0.002}, "label_mass": 0.97},
+  "category": {"type": "choice", "answer": "B", "option": "drill",
+               "probabilities": {"A": 0.01, "B": 0.98, "C": 0.005, "D": 0.005},
+               "legend": {"A": "accessory", "B": "drill", "C": "battery", "D": "charger"}, "label_mass": 0.99},
+  "completeness": {"type": "score", "answer": 2, "level": "good", "expected": 1.93,
+                   "probabilities": {"0": 0.01, "1": 0.05, "2": 0.94},
+                   "legend": {"0": "poor", "1": "fair", "2": "good"}, "label_mass": 0.98}},
+ "usage": {"prompt_tokens": 410, "cached_tokens": 192}}
+```
+
+`label_mass` shows how much of the model's next-token probability falls on
+the expected answers. A low value means the model would rather write
+something else, for example a capitalized "Yes"; such a question deserves
+rewording before its probabilities are trusted.
+
 ## Limits
 
 - Labels must be single tokens. A multi-token answer needs a prefix that ends
   where the answers diverge, or `label_token_ids`.
+- Bit-identical results across packing and cache need the prefix rows to come
+  from score prefills, or from prefill chunks of more than 32 rows. A prefix
+  that a Chat request computed in small chunks carries its K-split rounding,
+  which a score request resuming from it inherits.
 - Score requests occupy a lane only during prefill. They follow the same
   priority and decode-share rules as Chat prefill.
 - The SSD tier does not keep Qwen3.8-Flash-Next's QSA index keys (see

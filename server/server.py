@@ -566,6 +566,7 @@ class FrontendHandler(BaseHTTPRequestHandler):
             "/v1/judgments",
             "/v1/systemone",
             "/v1/score",
+            "/v1/decisions",
         ):
             self._safe_error(APIError(404, "not found", "not_found"))
             return
@@ -645,6 +646,9 @@ class FrontendHandler(BaseHTTPRequestHandler):
                 return
             if path == "/v1/score":
                 self._score(body, deadline, started_at)
+                return
+            if path == "/v1/decisions":
+                self._decisions(body, deadline)
                 return
             responses = path == "/v1/responses"
             stream = body.get("stream", False)
@@ -808,22 +812,29 @@ class FrontendHandler(BaseHTTPRequestHandler):
             bodies = [{**shared, **item} for item in items]
         else:
             bodies = [body]
+        responses = self._run_scores(bodies, deadline, indexed=batched)
+        self._json(
+            200,
+            {"object": "list", "data": responses} if batched else responses[0],
+        )
+
+    def _run_scores(self, bodies, deadline, *, indexed):
+        """Prepare every score request, submit them together and return their
+        /v1/score results in order; errors name requests[i] when indexed."""
         jobs = []
         try:
             for index, item in enumerate(bodies):
                 jobs.append(
                     self.app.prepare_score(
-                        item, deadline=deadline, index=index if batched else None
+                        item, deadline=deadline, index=index if indexed else None
                     )
                 )
             remaining_request_time(deadline)
             if self._client_disconnected():
                 raise ConnectionResetError("client disconnected before submission")
-            submitted = []
             for job in jobs:
                 if not self.app.backend.submit(job):
                     raise _queue_full()
-                submitted.append(job)
             results = [self._score_result(job) for job in jobs]
         except BaseException:
             for job in jobs:
@@ -847,9 +858,30 @@ class FrontendHandler(BaseHTTPRequestHandler):
                 )
             )
             self.app.record_score(result.prompt_tokens, cached, total / 1000.0)
+        return responses
+
+    def _decisions(self, body, deadline):
+        """POST /v1/decisions: each question a single-token score over the
+        shared input (scoring.decision_requests)."""
+        try:
+            bodies, questions = scoring.decision_requests(body)
+        except scoring.ScoreRequestError as error:
+            raise APIError(400, str(error)) from error
+        scores = self._run_scores(bodies, deadline, indexed=False)
         self._json(
             200,
-            {"object": "list", "data": responses} if batched else responses[0],
+            {
+                "object": "decisions",
+                "model": self.app.model,
+                "answers": {
+                    question.qid: scoring.decision_answer(question, score)
+                    for question, score in zip(questions, scores)
+                },
+                "usage": {
+                    "prompt_tokens": sum(score["usage"]["prompt_tokens"] for score in scores),
+                    "cached_tokens": sum(score["usage"]["cached_tokens"] for score in scores),
+                },
+            },
         )
 
     def _score_result(self, job):

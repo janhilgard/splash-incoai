@@ -389,7 +389,7 @@ void QwenTarget::addPrefillOutput(PrefillStep &step, metal::MetalBuffer hidden, 
   if (projection.layout() == ops::WeightLayout::Affine64)
     operators_.linear().addPrefillSums(step.graph, hidden, b.projectionSums, projection, step.rows);
   operators_.linear().addPrefillResidual(step.graph, hidden, projection, input, output, b.projectionSums,
-                                         step.rows, b.linearScratch);
+                                         step.rows, b.linearScratch, step.buffers.splitFree);
 }
 
 metal::MetalBuffer QwenTarget::addPrefillMixer(PrefillStep &step, const QwenGdnWeights &mixer,
@@ -398,7 +398,7 @@ metal::MetalBuffer QwenTarget::addPrefillMixer(PrefillStep &step, const QwenGdnW
   const uint32_t layer = step.gdnLayer++;
   addPrefillNorm(step, input, norm, mixer.inputProjection.layout());
   operators_.linear().addPrefill(step.graph, b.normalized, mixer.inputProjection, b.gdnPacked, b.projectionSums,
-                                 step.rows, b.linearScratch);
+                                 step.rows, b.linearScratch, step.buffers.splitFree);
   for (const QwenTargetPrefillSequence &sequence : step.sequences) {
     const auto u16 = [&](const metal::MetalBuffer &buffer, uint32_t width) {
       return rowsOf<uint16_t>(backend_, buffer, sequence.rowBegin, sequence.rows, width);
@@ -426,7 +426,7 @@ metal::MetalBuffer QwenTarget::addPrefillMixer(PrefillStep &step, const QwenAtte
   const uint32_t layer = step.attentionLayer++;
   addPrefillNorm(step, input, norm, mixer.inputProjection.layout());
   operators_.linear().addPrefill(step.graph, b.normalized, mixer.inputProjection, b.fullPacked, b.projectionSums,
-                                 step.rows, b.linearScratch);
+                                 step.rows, b.linearScratch, step.buffers.splitFree);
   for (const QwenTargetPrefillSequence &sequence : step.sequences) {
     const auto u16 = [&](const metal::MetalBuffer &buffer, uint32_t width) {
       return rowsOf<uint16_t>(backend_, buffer, sequence.rowBegin, sequence.rows, width);
@@ -468,12 +468,12 @@ void QwenTarget::addPrefillFfn(PrefillStep &step, const Qwen3_8LayerWeights &lay
   const ops::Linear &linear = operators_.linear();
   addPrefillNorm(step, residual, layer.postAttentionNorm, layer.gateProjection.layout());
   linear.addPrefill(step.graph, b.normalized, layer.gateProjection, b.denseGateScratch, b.projectionSums,
-                    step.rows, b.linearScratch);
+                    step.rows, b.linearScratch, step.buffers.splitFree);
   linear.addPrefillUpWithGate(step.graph, b.normalized, layer.upProjection, b.denseGateScratch,
                               b.denseIntermediate, b.projectionSums, b.downProjectionSums, step.rows,
-                              b.linearScratch);
+                              b.linearScratch, step.buffers.splitFree);
   linear.addPrefillResidual(step.graph, b.denseIntermediate, layer.downProjection, residual, output,
-                            b.downProjectionSums, step.rows, b.linearScratch);
+                            b.downProjectionSums, step.rows, b.linearScratch, step.buffers.splitFree);
 }
 
 void QwenTarget::addPrefillFfn(PrefillStep &step, const Qwen3_6MoeLayerWeights &layer,
@@ -693,7 +693,7 @@ metal::MetalBuffer QwenTarget::addQwen4Prefill(PrefillStep &step, const Qwen4Exp
   const uint32_t rows = step.rows;
   const auto project = [&](metal::MetalBuffer input, const ops::Projection &projection, metal::MetalBuffer output) {
     linear.addPrefill(step.graph, std::move(input), projection, std::move(output), b.projectionSums, rows,
-                      b.linearScratch);
+                      b.linearScratch, step.buffers.splitFree);
   };
   // The mix of the streams into b.normalized and, when it injects, the
   // injection weights into h.weights.

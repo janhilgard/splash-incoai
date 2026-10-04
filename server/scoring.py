@@ -210,3 +210,113 @@ def score_response(model, labels, token_ids, options, result, *, tokenizer, cach
             "total_ms": result.request_wall_ms,
         },
     }
+
+
+# ---------------------------------------------------------------- decisions
+
+DECISION_FIELDS = {"model", "system", "input", "questions", "priority", "timeout",
+                   "reasoning_effort", "chat_template_kwargs"}
+QUESTION_TYPES = ("yes_no", "choice", "score")
+CHOICE_LETTERS = "ABCDEFGH"
+MAX_DECISION_QUESTIONS = 32
+
+
+@dataclass(frozen=True)
+class DecisionQuestion:
+    """One /v1/decisions question: its prompt suffix and single-token labels,
+    and how its answer reads them."""
+
+    qid: str
+    kind: str
+    text: str
+    labels: tuple
+    meanings: tuple
+
+
+def _question(qid, spec):
+    where = f"questions.{qid}"
+    if not isinstance(spec, dict):
+        raise ScoreRequestError(f"{where} must be an object")
+    unknown = sorted(set(spec) - {"type", "question", "options", "levels"})
+    if unknown:
+        raise ScoreRequestError(f"{where} has unsupported fields: {', '.join(unknown)}")
+    kind = spec.get("type")
+    if kind not in QUESTION_TYPES:
+        raise ScoreRequestError(f"{where}.type must be one of {', '.join(QUESTION_TYPES)}")
+    question = spec.get("question")
+    if not isinstance(question, str) or not question.strip():
+        raise ScoreRequestError(f"{where}.question must be a nonempty string")
+    if kind == "yes_no":
+        return DecisionQuestion(
+            qid, kind, f"{question}\nAnswer with exactly one word: yes or no.",
+            ("yes", "no"), ("yes", "no"))
+    if kind == "choice":
+        options = spec.get("options")
+        if (not isinstance(options, list) or not 2 <= len(options) <= len(CHOICE_LETTERS)
+                or any(not isinstance(option, str) or not option.strip() for option in options)):
+            raise ScoreRequestError(
+                f"{where}.options must be 2 to {len(CHOICE_LETTERS)} nonempty strings")
+        letters = CHOICE_LETTERS[: len(options)]
+        legend = "\n".join(f"{letter}) {option}" for letter, option in zip(letters, options))
+        return DecisionQuestion(
+            qid, kind, f"{question}\n{legend}\nAnswer with the letter only.",
+            tuple(letters), tuple(options))
+    levels = spec.get("levels")
+    if (not isinstance(levels, list) or not 2 <= len(levels) <= 10
+            or any(not isinstance(level, str) or not level.strip() for level in levels)):
+        raise ScoreRequestError(f"{where}.levels must be 2 to 10 nonempty strings")
+    legend = "\n".join(f"{index} = {level}" for index, level in enumerate(levels))
+    return DecisionQuestion(
+        qid, kind, f"{question}\n{legend}\nAnswer with the number only.",
+        tuple(str(index) for index in range(len(levels))), tuple(levels))
+
+
+def decision_requests(body):
+    """The score request bodies of a /v1/decisions request, one per question
+    in order, and its questions. Every question is a suffix of the shared
+    input, so the input's prefix is computed once and reused."""
+    unknown = sorted(set(body) - DECISION_FIELDS)
+    if unknown:
+        raise ScoreRequestError(f"unsupported fields: {', '.join(unknown)}")
+    text = body.get("input")
+    if not isinstance(text, str) or not text.strip():
+        raise ScoreRequestError("input must be a nonempty string")
+    system = body.get("system")
+    if system is not None and not isinstance(system, str):
+        raise ScoreRequestError("system must be a string")
+    questions = body.get("questions")
+    if not isinstance(questions, dict) or not questions:
+        raise ScoreRequestError("questions must be a nonempty object")
+    if len(questions) > MAX_DECISION_QUESTIONS:
+        raise ScoreRequestError(f"questions must contain at most {MAX_DECISION_QUESTIONS} entries")
+    parsed = [_question(qid, spec) for qid, spec in questions.items()]
+    shared = {key: body[key] for key in ("model", "priority", "timeout", "reasoning_effort",
+                                          "chat_template_kwargs") if key in body}
+    requests = []
+    for question in parsed:
+        messages = ([{"role": "system", "content": system}] if system else []) + [
+            {"role": "user", "content": f"{text}\n\n{question.text}"}
+        ]
+        requests.append({**shared, "messages": messages, "labels": list(question.labels)})
+    return requests, parsed
+
+
+def decision_answer(question, score):
+    """One question's answer from its /v1/score result."""
+    probabilities = [entry["prob"] for entry in score["labels"]]
+    best = max(range(len(probabilities)), key=lambda index: (probabilities[index], -index))
+    answer = {
+        "type": question.kind,
+        "probabilities": dict(zip(question.labels, probabilities)),
+        "label_mass": score["label_mass"],
+    }
+    if question.kind == "yes_no":
+        answer.update(answer=question.labels[best], p_yes=probabilities[0])
+    elif question.kind == "choice":
+        answer.update(answer=question.labels[best], option=question.meanings[best],
+                      legend=dict(zip(question.labels, question.meanings)))
+    else:
+        answer.update(answer=best, level=question.meanings[best],
+                      expected=sum(index * p for index, p in enumerate(probabilities)),
+                      legend=dict(zip(question.labels, question.meanings)))
+    return answer

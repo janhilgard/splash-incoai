@@ -1071,6 +1071,13 @@ struct Runtime::Impl {
       }
     }
     QwenTargetPrefillBuffers buffers;
+    // A chunk that prefills a score request runs split-free, so its logits
+    // are the same bits whatever it is packed with or how its prompt is
+    // chunked (QwenTargetPrefillBuffers::splitFree).
+    buffers.splitFree = std::any_of(batch.sequences.begin(), batch.sequences.end(),
+                                    [](const PackedPrefillSequence &sequence) {
+                                      return !sequence.entry->scoreTokens.empty();
+                                    });
     // Prefill plans read plain bf16 rows, so there is no input table or sums.
     buffers.linearScratch = {.partials = p(PrefillTensor::LinearPartials),
                              .counters = p(PrefillTensor::LinearCounters),

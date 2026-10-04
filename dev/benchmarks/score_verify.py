@@ -85,6 +85,9 @@ def load_items(path):
         return [json.loads(line) for line in file if line.strip()]
 
 
+SYNTHETIC_PREFIX = os.environ.get("SCORE_PREFIX", '{\n"same":')
+
+
 def synthetic_items(count):
     """Product-matching prompts for runs without the client's JSONL."""
     pairs = [
@@ -109,7 +112,7 @@ def synthetic_items(count):
             {
                 "system": system,
                 "user": f"Listing {index}.\nA: {a}\nB: {b}",
-                "prefix": DEFAULT_PREFIX,
+                "prefix": SYNTHETIC_PREFIX,
                 "labels": DEFAULT_LABELS,
             }
         )
@@ -137,6 +140,7 @@ def check_agree(client, args):
     items = items_of(args)
     agree_chat = agree_completion = compared_chat = 0
     prefix_mismatch = []
+    natural_prefixes = {}
     errors = []
     for index, item in enumerate(items):
         status, score = client.post("/v1/score", score_body(client, item))
@@ -155,27 +159,44 @@ def check_agree(client, args):
                 "reasoning_effort": "none",
             },
         )
-        content = chat["choices"][0]["message"].get("content") or "" if status == 200 else ""
-        rest = content.lstrip()
-        if rest.startswith(prefix):
-            after = rest[len(prefix):]
+        content = (chat["choices"][0]["message"].get("content") or "") if status == 200 else ""
+        # The prefix the model itself writes: its output up to the end of the
+        # prefix's key (for '{"same":' the text through '"same":'), which may
+        # differ from the given prefix in whitespace such as '{\n"same":'.
+        key = prefix.lstrip("{[ \n")
+        position = content.find(key) if key else -1
+        if position < 0:
+            prefix_mismatch.append({"index": index, "generated": content[:60]})
+        else:
+            natural = content[: position + len(key)]
+            after = content[position + len(key):]
             generated = next((label for label in labels if after.startswith(label)), None)
+            if natural != prefix:
+                natural_prefixes[natural] = natural_prefixes.get(natural, 0) + 1
+                status, natural_score = client.post(
+                    "/v1/score", score_body(client, {**item, "prefix": natural})
+                )
+                if status != 200:
+                    errors.append({"index": index, "kind": "chat", "natural_prefix": natural,
+                                   "score_status": status, "error": natural_score})
+                    continue
+            else:
+                natural_score = score
             compared_chat += 1
-            if generated == score["argmax"]:
+            if generated == natural_score["argmax"]:
                 agree_chat += 1
             else:
                 errors.append(
                     {
                         "index": index,
                         "kind": "chat",
-                        "argmax": score["argmax"],
+                        "prefix": natural,
+                        "argmax": natural_score["argmax"],
                         "generated": after[:20],
-                        "labels": score["labels"],
+                        "labels": natural_score["labels"],
                         "item": item,
                     }
                 )
-        else:
-            prefix_mismatch.append({"index": index, "generated": content[:60]})
         status, template = client.post(
             "/apply-template",
             {"model": client.model, "messages": item.get("messages") or messages_of(item),
@@ -204,7 +225,8 @@ def check_agree(client, args):
             "completion_agree": agree_completion,
             "chat_compared": compared_chat,
             "chat_agree": agree_chat,
-            "chat_prefix_mismatch": len(prefix_mismatch),
+            "chat_key_missing": len(prefix_mismatch),
+            "natural_prefixes": natural_prefixes,
             "prefix_mismatch_examples": prefix_mismatch[:5],
             "disagreements": errors,
         },
@@ -363,6 +385,7 @@ def check_regress(client, args):
         [{"role": "user", "content": "Explain how a hash map works in three sentences."}],
         [{"role": "user", "content": "List five prime numbers above 100."}],
     ]
+    submitted_before = client.get("/status")["requests"]["submitted"]
     outputs = []
     for messages in prompts:
         status, chat = client.post("/v1/chat/completions", {"model": client.model, "messages": messages,
@@ -377,8 +400,12 @@ def check_regress(client, args):
         with open(args.check_file) as file:
             before = json.load(file)
         same = [a == b for a, b in zip(before, outputs)]
+        # Requests other clients sent during the run: batching with them can
+        # change greedy output (Splash repeats it only when a request runs alone).
+        foreign = client.get("/status")["requests"]["submitted"] - submitted_before - len(prompts)
         record(args, "regress_check", {"prompts": len(outputs), "identical": sum(same),
-                                       "differing": [i for i, s in enumerate(same) if not s], "pass": all(same)})
+                                       "differing": [i for i, s in enumerate(same) if not s],
+                                       "foreign_requests_during_run": foreign, "pass": all(same)})
 
 
 def main():

@@ -75,6 +75,10 @@ struct LinearWorkload final {
   LinearPhase phase = LinearPhase::Decode;
   LinearEpilogue epilogue = LinearEpilogue::None;
   WeightLayout weightLayout = WeightLayout::Affine64;
+  // Prefill only: run small chunks without a K split, so each row's output
+  // is the same bits whatever chunk or packed batch it is in (scoring reads
+  // final-position logits that must not depend on other requests).
+  bool splitFree = false;
   auto operator<=>(const LinearWorkload &) const = default;
 };
 
@@ -242,7 +246,7 @@ public:
   // The plans of this projection's matrix in its layout. A decode plan's
   // input() is the layout its producer writes.
   [[nodiscard]] LinearPlan prefillPlan(const Projection &projection, uint32_t rows,
-                                       LinearEpilogue epilogue) const;
+                                       LinearEpilogue epilogue, bool splitFree = false) const;
   [[nodiscard]] LinearPlan decodePlan(const Projection &projection, uint32_t lanes,
                                       LinearEpilogue epilogue = LinearEpilogue::None,
                                       const Projection *gate = nullptr) const;
@@ -272,15 +276,17 @@ public:
   // The projections of `rows` rows through their own matrix. `scratch` holds
   // the partials and counters of split plans (GGUF chunks of up to 32 rows);
   // reused serially within one command stream, as in decode.
+  // With splitFree, chunks of up to 32 rows run unsplit (LinearWorkload).
   void addPrefill(metal::CommandGraph &graph, metal::MetalBuffer input, const Projection &projection,
                   metal::MetalBuffer output, metal::MetalBuffer sums, uint32_t rows,
-                  LinearScratch scratch = {}) const;
+                  LinearScratch scratch = {}, bool splitFree = false) const;
   void addPrefillUpWithGate(metal::CommandGraph &graph, metal::MetalBuffer input, const Projection &up,
                             metal::MetalBuffer gateScratch, metal::MetalBuffer output, metal::MetalBuffer sums,
-                            metal::MetalBuffer downSums, uint32_t rows, LinearScratch scratch = {}) const;
+                            metal::MetalBuffer downSums, uint32_t rows, LinearScratch scratch = {},
+                            bool splitFree = false) const;
   void addPrefillResidual(metal::CommandGraph &graph, metal::MetalBuffer input, const Projection &projection,
                           metal::MetalBuffer residual, metal::MetalBuffer output, metal::MetalBuffer sums,
-                          uint32_t rows, LinearScratch scratch = {}) const;
+                          uint32_t rows, LinearScratch scratch = {}, bool splitFree = false) const;
 
   PreparedInput addDecode(metal::CommandGraph &graph, metal::MetalBuffer input, const Projection &projection,
                           metal::MetalBuffer output, LinearScratch scratch = {}) const;

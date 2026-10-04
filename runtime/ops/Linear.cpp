@@ -633,8 +633,11 @@ LinearPlan Linear::decodePlan(const Projection &p, uint32_t lanes, LinearEpilogu
                               const Projection *gate) const {
   return plan(decode({p.outputSize, p.inputSize}, lanes, epilogue), p, gate);
 }
-LinearPlan Linear::prefillPlan(const Projection &p, uint32_t rows, LinearEpilogue epilogue) const {
-  return plan({{p.outputSize, p.inputSize}, rows, LinearPhase::Prefill, epilogue}, p);
+LinearPlan Linear::prefillPlan(const Projection &p, uint32_t rows, LinearEpilogue epilogue,
+                               bool splitFree) const {
+  LinearWorkload workload{{p.outputSize, p.inputSize}, rows, LinearPhase::Prefill, epilogue};
+  workload.splitFree = splitFree;
+  return plan(workload, p);
 }
 
 LinearScratchSize Linear::decodeScratchSize(LinearWorkload w) const {
@@ -759,24 +762,24 @@ void Linear::addPrefillSums(metal::CommandGraph &graph, metal::MetalBuffer input
 }
 void Linear::addPrefill(metal::CommandGraph &graph, metal::MetalBuffer input, const Projection &p,
                         metal::MetalBuffer output, metal::MetalBuffer sums, uint32_t rows,
-                        LinearScratch scratch) const {
+                        LinearScratch scratch, bool splitFree) const {
   add(graph, {.input = input, .output = output, .sums = sums, .scratch = scratch}, p,
-      prefillPlan(p, rows, LinearEpilogue::None));
+      prefillPlan(p, rows, LinearEpilogue::None, splitFree));
 }
 void Linear::addPrefillResidual(metal::CommandGraph &graph, metal::MetalBuffer input, const Projection &p,
                                 metal::MetalBuffer residual, metal::MetalBuffer output, metal::MetalBuffer sums,
-                                uint32_t rows, LinearScratch scratch) const {
+                                uint32_t rows, LinearScratch scratch, bool splitFree) const {
   add(graph, {.input = input, .output = output, .sums = sums, .residual = residual, .scratch = scratch}, p,
-      prefillPlan(p, rows, LinearEpilogue::Residual));
+      prefillPlan(p, rows, LinearEpilogue::Residual, splitFree));
 }
 void Linear::addPrefillUpWithGate(metal::CommandGraph &graph, metal::MetalBuffer input, const Projection &up,
                                   metal::MetalBuffer gateScratch, metal::MetalBuffer output,
                                   metal::MetalBuffer sums, metal::MetalBuffer downSums, uint32_t rows,
-                                  LinearScratch scratch) const {
+                                  LinearScratch scratch, bool splitFree) const {
   add(graph,
       {.input = input, .output = output, .sums = sums, .gateScratch = gateScratch, .downSums = downSums,
        .scratch = scratch},
-      up, prefillPlan(up, rows, LinearEpilogue::UpWithGate));
+      up, prefillPlan(up, rows, LinearEpilogue::UpWithGate, splitFree));
 }
 PreparedInput Linear::addDecode(metal::CommandGraph &graph, metal::MetalBuffer input, const Projection &p,
                                 metal::MetalBuffer output, LinearScratch scratch) const {

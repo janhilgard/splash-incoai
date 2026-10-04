@@ -256,6 +256,10 @@ struct QwenHyperBuffers final {
 struct QwenTargetPrefillBuffers final {
   // Split projections of chunks of up to 32 rows (LinearGguf.cpp).
   ops::LinearScratch linearScratch{};
+  // Run the chunk's projections split-free (ops::LinearWorkload::splitFree):
+  // set when it prefills a score request, whose final-position logits must
+  // not depend on the rows it is packed with.
+  bool splitFree = false;
   std::array<metal::MetalBuffer, 2> hidden;
   metal::MetalBuffer normalized;
   metal::MetalBuffer captured;

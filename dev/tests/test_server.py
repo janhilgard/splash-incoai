@@ -1569,6 +1569,90 @@ class ServerTest(unittest.TestCase):
         self.assertEqual(status, 400, payload)
         self.assertIn("requests[0].", json.loads(payload)["error"]["message"])
 
+    class WordTokenizer(ScoreTokenizer):
+        """Character tokens, except that "yes" and "no" are one token each."""
+
+        WORDS = {"yes": 0x10FF00, "no": 0x10FF01}
+
+        def encode(self, text, **kwargs):
+            tokens, index = [], 0
+            while index < len(text):
+                for word, token in self.WORDS.items():
+                    if text.startswith(word, index):
+                        tokens.append(token)
+                        index += len(word)
+                        break
+                else:
+                    tokens.append(ord(text[index]))
+                    index += 1
+            return tokens
+
+        def decode(self, token_ids, **kwargs):
+            names = {token: word for word, token in self.WORDS.items()}
+            return "".join(names.get(token, chr(token) if token < 0x10FF00 else "") for token in token_ids)
+
+    def test_decisions_answer_each_question_type_over_the_shared_input(self):
+        runtime = FakeRuntime(
+            Plan(logits=(2.0, 0.0), normalizer=2.5),
+            Plan(logits=(0.0, 3.0, 1.0), normalizer=3.5),
+            Plan(logits=(0.0, 1.0, 2.0), normalizer=2.5),
+        )
+        harness = self.harness(runtime, tokenizer=self.WordTokenizer(), max_context=8192)
+        body = {
+            "system": "You classify product listings.",
+            "input": "Listing: cordless drill 18V, 2 batteries",
+            "reasoning_effort": "none",
+            "questions": {
+                "is_tool": {"type": "yes_no", "question": "Is it a power tool?"},
+                "category": {"type": "choice", "question": "Which category?",
+                             "options": ["accessory", "drill", "battery"]},
+                "quality": {"type": "score", "question": "How complete is the listing?",
+                            "levels": ["poor", "fair", "good"]},
+            },
+        }
+        status, _, payload = harness.request("POST", "/v1/decisions", body)
+        self.assertEqual(status, 200, payload)
+        answers = json.loads(payload)["answers"]
+        self.assertEqual(answers["is_tool"]["answer"], "yes")
+        self.assertAlmostEqual(answers["is_tool"]["p_yes"], math.exp(2) / (math.exp(2) + 1))
+        self.assertEqual(answers["category"]["answer"], "B")
+        self.assertEqual(answers["category"]["option"], "drill")
+        self.assertEqual(answers["quality"]["answer"], 2)
+        self.assertEqual(answers["quality"]["level"], "good")
+        self.assertGreater(answers["quality"]["expected"], 1.0)
+        # Every question follows the same system and input; only its suffix
+        # differs (the messages each request's template rendered).
+        rendered = [
+            messages for messages, options in harness.tokenizer.templates
+            if options.get("tokenize") is False and options.get("add_generation_prompt")
+        ][-3:]
+        users = [messages[-1]["content"] for messages in rendered]
+        shared = "Listing: cordless drill 18V, 2 batteries\n\n"
+        self.assertTrue(all(user.startswith(shared) for user in users), users)
+        self.assertTrue(all(messages[0]["content"] == "You classify product listings." for messages in rendered))
+        self.assertIn("A) accessory\nB) drill\nC) battery\nAnswer with the letter only.", users[1])
+        self.assertIn("0 = poor\n1 = fair\n2 = good\nAnswer with the number only.", users[2])
+        self.assertEqual(runtime.requests[0].score_tokens, (0x10FF00, 0x10FF01))
+        self.assertEqual(runtime.requests[1].score_tokens, (ord("A"), ord("B"), ord("C")))
+
+    def test_decisions_reject_invalid_questions(self):
+        runtime = FakeRuntime()
+        harness = self.harness(runtime, tokenizer=self.WordTokenizer(), max_context=8192)
+        for body, fragment in (
+            ({"questions": {"q": {"type": "yes_no", "question": "x"}}}, "input"),
+            ({"input": "x", "questions": {}}, "nonempty object"),
+            ({"input": "x", "questions": {"q": {"type": "maybe", "question": "x"}}}, "type must be"),
+            ({"input": "x", "questions": {"q": {"type": "choice", "question": "x", "options": ["a"]}}},
+             "options"),
+            ({"input": "x", "questions": {"q": {"type": "score", "question": "x", "levels": ["a"] * 11}}},
+             "levels"),
+        ):
+            with self.subTest(body=body):
+                status, _, payload = harness.request("POST", "/v1/decisions", body)
+                self.assertEqual(status, 400, payload)
+                self.assertIn(fragment, json.loads(payload)["error"]["message"])
+        self.assertEqual(runtime.requests, [])
+
     def test_judgments_rejects_invalid_rows_before_inference(self):
         runtime = FakeRuntime()
         harness = self.harness(
