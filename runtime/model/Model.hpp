@@ -327,6 +327,11 @@ struct ModelStepResult final {
   // rest of the batch stands. Broken invariants and GPU faults stay
   // exceptions and remain engine-fatal.
   std::string failure{};
+  // With scoreLogits: the position's log-sum-exp over the whole vocabulary
+  // (fp64 over the fp32 logits) and its highest logits, descending.
+  double scoreLogNormalizer = 0.0;
+  std::vector<uint32_t> scoreTopIds{};
+  std::vector<float> scoreTopLogits{};
 
   bool operator==(const ModelStepResult &) const = default;
 };
@@ -395,6 +400,8 @@ struct ExecutionLimits final {
   // 2..255 distinct token ids and returns their raw final-position logits.
   static constexpr uint32_t minimumScoreOptions = 2;
   static constexpr uint32_t maximumScoreOptions = 255;
+  // Highest final-position logits a score result reports.
+  static constexpr uint32_t scoreTopTokens = 20;
 };
 
 static_assert(ExecutionLimits::draftQueryRows ==
