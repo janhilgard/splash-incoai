@@ -7,8 +7,8 @@ Branch `decision-scoring` (worktree `~/splash-score`). Measured on the studio
 `dev/benchmarks/score_verify.py`. Raw records are in
 `~/splash-bench/score/35b.jsonl`.
 
-Qwen3.8-Flash-Next (:8003) is not yet verified. It needs its own window,
-because a test instance does not fit beside production (~118 GB).
+Qwen3.8-Flash-Next (:8003) was verified the same day, after both production
+instances moved to this build (see "Qwen3.8-Flash-Next" below).
 
 ## Design in brief
 
@@ -51,6 +51,17 @@ Packing: a prefill command carries at most 4 sequences
 (`ExecutionLimits::maximumBatchWidth`). Throughput levels off at about
 2 300 requests/min from concurrency 12 on. Packing more score sequences would
 mean larger state and arena allocations; that is not done here.
+
+## Qwen3.8-Flash-Next (:8003)
+
+| # | Check | Result |
+| --- | --- | --- |
+| 1 | Agreement, 300 prompts | **300/300** against Chat and **300/300** against `/v1/completions`; the model writes the compact `{"same":` (299×), unlike 35B |
+| 2 | Determinism, 20× | spread **0.0** |
+| 3 | Concurrency 1 / 4 / 24 | **0.0 / 0.0 / 0.0** |
+| 4 | Cold vs warm cache (stateful GDN cache) | **0.0** |
+| 5 | Sanity | pass |
+| — | Chat regression | 15/15 bit-identical cold and 15/15 warm against the previous build, with the same cache history (Flash-Next's warm Chat output depends on which boundaries the cache holds, so the A/B restarts each build and runs cold, then warm) |
 
 ## Finding: batch-dependent prefill numerics
 
