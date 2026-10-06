@@ -685,7 +685,7 @@ metal::MetalBuffer QwenTarget::addQwen4Prefill(PrefillStep &step, const Qwen4Exp
   const uint32_t rows = step.rows;
   const auto project = [&](metal::MetalBuffer input, const ops::Projection &projection, metal::MetalBuffer output) {
     linear.addPrefill(step.graph, std::move(input), projection, std::move(output), b.projectionSums, rows,
-                      b.linearScratch);
+                      b.linearScratch, b.splitFree);
   };
   // The mix of the streams into b.normalized and, when it injects, the
   // injection weights into h.weights.
