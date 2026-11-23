@@ -47,6 +47,7 @@
 #define SPLASH_DEFAULT_LANES 4u
 #define SPLASH_PREFILL_TOKEN_BUDGET 2048u
 #define SPLASH_DRAFT_SLIDING_WINDOW 2048u
+#define SPLASH_DSPARK_CONTEXT_TOKENS 8192u
 #define SPLASH_TARGET_KV_BLOCK_TOKENS 32u
 // Attention runs a sequence's rows in tiles of this many, each over at most
 // SPLASH_ATTENTION_MAXIMUM_SPLITS history splits (ops::PagedAttention).

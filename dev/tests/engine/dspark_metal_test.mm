@@ -65,7 +65,6 @@ constexpr uint32_t kKvHeads = SPLASH_DRAFT_KV_HEADS;
 constexpr uint32_t kHeadDim = SPLASH_DRAFT_HEAD_DIMENSION;
 constexpr uint32_t kHeads = 24;
 constexpr uint32_t kOwn = kHeads / kKvHeads;
-constexpr uint32_t kWindow = SPLASH_DRAFT_SLIDING_WINDOW;
 // A DSpark draft's attention: 24 query heads, its q/k/v rows of its own.
 constexpr ops::DraftAttentionShape kShape{2304, 0, kHeads * kHeadDim + 2 * kKvHeads * kHeadDim, kHeads * kHeadDim,
                                           kHeads, kKvHeads, kHeadDim};
@@ -127,9 +126,12 @@ void mix(MetalBackend &backend) {
 
 // The prepare of 24 query heads and the core over the rings in row-uniform
 // windows, against the host.
-void attention(MetalBackend &backend, uint32_t lanes, uint32_t windowKeys, std::array<uint32_t, kLanes> lengths) {
+void attention(MetalBackend &backend, uint32_t lanes, uint32_t windowKeys, std::array<uint32_t, kLanes> lengths,
+               uint32_t kWindow) {
   Random random(0xa77e + lanes * 131 + windowKeys + lengths[0]);
-  const auto plan = ops::DraftAttention::plan(kShape, lanes);
+  auto shape = kShape;
+  shape.contextTokens = kWindow;
+  const auto plan = ops::DraftAttention::plan(shape, lanes);
   const ops::DraftAttentionWorkspace workspace = plan.workspace();
   const uint64_t rows = uint64_t{lanes} * kRows;
   const MetalBuffer qkv = randomBf16(backend, rows * kShape.qkvSize, random, 3.0F);
@@ -750,10 +752,13 @@ int main(int argc, char **argv) {
       if (argc != 2) throw std::invalid_argument("usage: dspark METALLIB");
       MetalBackend backend(argv[1]);
       mix(backend);
-      for (uint32_t lanes = 1; lanes <= kLanes; ++lanes) {
-        attention(backend, lanes, 1024, {0, 1030, 2047, 5000});
-        attention(backend, lanes, kWindow - 1, {9, 2048, 2047, 4100});
-      }
+      for (uint32_t kWindow : {SPLASH_DRAFT_SLIDING_WINDOW, SPLASH_DSPARK_CONTEXT_TOKENS})
+        for (uint32_t lanes = 1; lanes <= kLanes; ++lanes) {
+          attention(backend, lanes, 1024, {0, 1030, 2047, 5000}, kWindow);
+          attention(backend, lanes, 2047, {2048, kWindow - 1, kWindow + 1027, 2 * kWindow + 17}, kWindow);
+          attention(backend, lanes, kWindow - 1, {9, 2048, 2047, 4100}, kWindow);
+          attention(backend, lanes, kWindow - 1, {kWindow - 1, kWindow, kWindow + 1, 2 * kWindow + 17}, kWindow);
+        }
       std::cout << "  attention: ok\n";
       for (uint32_t lanes : {1u, 4u})
         for (const bool sampled : {false, true}) markov(backend, lanes, sampled);

@@ -21,9 +21,6 @@ constexpr double kHealthCheckIntervalMilliseconds = 1000.0;
 // A mask request the server leaves unanswered for supervision::kMaskWait
 // fails its request; the batch's command slot is not held longer.
 constexpr double kMaskWaitMilliseconds = double(supervision::kMaskWait.count());
-// A junction costs a cached state, its capture and up to a draft window of
-// draft-context rows; a later request must save at least that much prefill.
-constexpr uint32_t kMinimumJunctionGain = model::ExecutionLimits::draftContextTokens;
 
 constexpr std::string_view kKvUnreadableMessage =
     "KV of an earlier part of the conversation could not be read from the SSD cache";
@@ -1262,16 +1259,17 @@ DraftContextPlan Engine::configureDraftStatePlan(Request &active,
   // Plan draft windows before prefill; arbitrary chunk ends do not carry a
   // complete draft state, the point the lane resumes from does. Progress
   // points remain disposable after restoration.
-  for (const uint32_t checkpoint : plannedCheckpoints(
-           stateBoundary, latestReplayBoundary, config_.prefillCheckpointTokens)) {
+  for (const uint32_t checkpoint :
+       plannedCheckpoints(stateBoundary, latestReplayBoundary,
+                          config_.prefillCheckpointTokens.value_or(2 * model_.draftContextTokens()))) {
     addStateBoundary(active, stateBoundary, checkpoint, true, true);
   }
-  if (junctionBoundary >= stateBoundary + kMinimumJunctionGain)
+  if (junctionBoundary >= stateBoundary + model_.draftContextTokens())
     addStateBoundary(active, stateBoundary, junctionBoundary, false, true);
   // The head's end, so that the next conversation sharing the head resumes there on first use. An ordinary state,
   // which a reclaim writes to the SSD as any other.
   if (const uint32_t head = active.request.headTokens / KvCache::pageTokens * KvCache::pageTokens;
-      head >= stateBoundary + kMinimumJunctionGain)
+      head >= stateBoundary + model_.draftContextTokens())
     addStateBoundary(active, stateBoundary, head, false, true);
   addStateBoundary(active, stateBoundary, latestReplayBoundary,
                    latestReplayBoundary != promptReplayBoundary(active), true);
@@ -1302,8 +1300,7 @@ bool Engine::addStateBoundary(Request &active, uint32_t after, uint32_t tokens,
   // The draft plan captures a new boundary's window from the planned
   // boundary before it, from `after` when the lane's draft state is
   // complete there, or whole past `after` (planDraftContext).
-  if (!completeAfter && found == remaining &&
-      tokens - after < model::ExecutionLimits::draftContextTokens)
+  if (!completeAfter && found == remaining && tokens - after < model_.draftContextTokens())
     return false;
   active.stateBoundaries.insert(found, {tokens, disposable});
   return true;
@@ -1331,7 +1328,7 @@ DraftContextPlan Engine::pendingDraftStatePlan(const Request &active,
   boundaries.reserve(active.stateBoundaries.size() - active.stateBoundaryCursor);
   for (size_t i = active.stateBoundaryCursor; i < active.stateBoundaries.size(); ++i)
     boundaries.push_back(active.stateBoundaries[i].tokens);
-  return planDraftContext(stateBoundary, active.replayTokens, boundaries);
+  return planDraftContext(stateBoundary, active.replayTokens, boundaries, model_.draftContextTokens());
 }
 
 void Engine::discardPendingStateBoundaries(Request &active) noexcept {

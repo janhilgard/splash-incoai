@@ -19,9 +19,8 @@ inline uint64_t draftContextRows(const DraftContextPlan &plan) {
 
 // Work expected by cold and prefix-hit benchmark requests, including the
 // engine's rolling recovery points and final reusable replay state.
-inline uint64_t expectedDraftContextRows(uint32_t promptTokens,
-                                         uint32_t checkpointTokens,
-                                         uint32_t restoredTokens = 0) {
+inline uint64_t expectedDraftContextRows(uint32_t promptTokens, uint32_t checkpointTokens, uint32_t restoredTokens = 0,
+                                         uint32_t windowTokens = model::ExecutionLimits::draftContextTokens) {
   if (!promptTokens)
     return 0;
   const uint32_t replayBoundary =
@@ -30,8 +29,7 @@ inline uint64_t expectedDraftContextRows(uint32_t promptTokens,
       engine::plannedCheckpoints(restoredTokens, replayBoundary, checkpointTokens);
   if (replayBoundary > restoredTokens)
     boundaries.push_back(replayBoundary);
-  return draftContextRows(
-      planDraftContext(restoredTokens, promptTokens, boundaries));
+  return draftContextRows(planDraftContext(restoredTokens, promptTokens, boundaries, windowTokens));
 }
 
 } // namespace splash::benchmark

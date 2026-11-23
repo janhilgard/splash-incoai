@@ -122,13 +122,21 @@ struct DFlashDraftLayout final {
 
   // Whether the model decodes with a draft: a draft has layers.
   [[nodiscard]] constexpr bool present() const noexcept { return layers != 0; }
+  // DFlash2 is trained with a 2K ring; DSpark's global layer reads 8K.
+  [[nodiscard]] constexpr uint32_t contextTokens() const noexcept {
+    return kind == DraftKind::DSpark ? SPLASH_DSPARK_CONTEXT_TOKENS : ExecutionLimits::draftContextTokens;
+  }
   // A DSpark draft's lane keeps each layer's context row of a slot in its
   // window, three windows of one row each side by side, and its f_rnn row
   // (bf16) beside its rings.
   [[nodiscard]] constexpr DraftStateLayout stateLayout() const noexcept {
     if (kind == DraftKind::DSpark)
-      return {layers, kvHeads, attentionHeadDimension, layers * hiddenSize,
-              hiddenSize * DraftStateLayout::bfloat16Bytes};
+      return {layers,
+              kvHeads,
+              attentionHeadDimension,
+              layers * hiddenSize,
+              hiddenSize * DraftStateLayout::bfloat16Bytes,
+              contextTokens()};
     return {layers, kvHeads, attentionHeadDimension, hiddenSize};
   }
   [[nodiscard]] constexpr std::span<const uint32_t> targetLayerIds() const noexcept {
@@ -137,9 +145,14 @@ struct DFlashDraftLayout final {
   // A row of the target rows it reads: one of hiddenSize values per layer.
   [[nodiscard]] constexpr uint32_t targetHiddenSize() const noexcept { return hiddenSize * targetLayerCount; }
   [[nodiscard]] constexpr ops::DraftAttentionShape attentionShape() const noexcept {
-    return {hiddenSize, dynamicSize, qkvSize, attentionSize,
-            attentionSize / attentionHeadDimension, kvHeads,
-            attentionHeadDimension};
+    return {hiddenSize,
+            dynamicSize,
+            qkvSize,
+            attentionSize,
+            attentionSize / attentionHeadDimension,
+            kvHeads,
+            attentionHeadDimension,
+            contextTokens()};
   }
   // The key and value columns of the fused QKV projection, all the context
   // writers read.

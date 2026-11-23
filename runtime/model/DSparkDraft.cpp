@@ -434,7 +434,7 @@ DFlashDraftStep DSparkDraft::step(std::span<const uint32_t> cacheLengths, std::s
 }
 
 metal::MetalBuffer DSparkDraft::layerWindow(const metal::MetalBuffer &window, uint32_t layer) const {
-  const uint64_t bytes = ops::DraftAttention::contextWindowBytes(layout_.hiddenSize);
+  const uint64_t bytes = ops::DraftAttention::contextWindowBytes(layout_.hiddenSize, layout_.contextTokens());
   return backend_.view(window, layer * bytes, bytes);
 }
 
@@ -442,7 +442,7 @@ ops::DraftAttentionWindow DSparkDraft::attentionWindow(uint32_t layer) const {
   // A windowed layer sees the window before the anchor, as trained; the
   // others the ring's every key but the slot the anchor's position takes.
   if (layout_.slidingLayers >> layer & 1) return {layout_.slidingWindow, true};
-  return {SPLASH_DRAFT_SLIDING_WINDOW - 1, true};
+  return {layout_.contextTokens() - 1, true};
 }
 
 void DSparkDraft::addContextPrefill(metal::CommandGraph &graph, DFlashPrefillBuffers buffers, uint32_t rows,
@@ -471,7 +471,7 @@ void DSparkDraft::addContextPrefill(metal::CommandGraph &graph, DFlashPrefillBuf
                          const metal::MetalBuffer &window) {
     for (uint32_t layer = 0; layer < layout_.layers; ++layer)
       ops::DraftAttention::addWindowStore(graph, contextRows(layer, compactRow, count), layerWindow(window, layer),
-                                          count, startPosition, hidden);
+                                          count, startPosition, hidden, layout_.contextTokens());
   };
   for (const DFlashPrefillSpan &span : spans) store(span.compactRow, span.rows, span.startPosition, span.window);
   // Only the window: a cached state keeps no rings.
@@ -483,12 +483,12 @@ void DSparkDraft::addContextPrefill(metal::CommandGraph &graph, DFlashPrefillBuf
 void DSparkDraft::addContextRebuild(metal::CommandGraph &graph, DFlashPrefillBuffers buffers,
                                     const metal::MetalBuffer &window, std::span<const DFlashDraftRingLayer> ring,
                                     uint32_t rows, uint32_t startPosition) const {
-  if (!rows || rows > ExecutionLimits::draftContextTokens || ring.size() != layout_.layers)
+  if (!rows || rows > ExecutionLimits::prefillTokenBudget || ring.size() != layout_.layers)
     throw std::invalid_argument("invalid draft context rebuild");
   for (uint32_t layer = 0; layer < layout_.layers; ++layer)
     ops::DraftAttention::addWindowLoad(graph, layerWindow(window, layer),
-                                       layerRows(backend_, buffers.hidden, layout_, layer, 0, rows), rows, startPosition,
-                                       layout_.hiddenSize);
+                                       layerRows(backend_, buffers.hidden, layout_, layer, 0, rows), rows,
+                                       startPosition, layout_.hiddenSize, layout_.contextTokens());
   const DFlashPrefillSpan span{0, rows, startPosition, ring, window};
   addContextKv(graph, buffers, rows, {&span, 1});
 }
@@ -619,7 +619,7 @@ void DSparkDraft::addContextCommit(metal::CommandGraph &graph, DFlashContextBuff
             graph, contextRows(layer), layerWindow(buffers.windows[lane], layer),
             backend_.view(buffers.retainedRows, lane * sizeof(uint32_t), sizeof(uint32_t)),
             backend_.view(buffers.laneRows, lane * sizeof(ops::LaneRows), sizeof(ops::LaneRows)), rows,
-            std::min(step.laneCap, rows), startPositions[lane], hidden);
+            std::min(step.laneCap, rows), startPositions[lane], hidden, layout_.contextTokens());
     linear.add(graph, {.input = contextRows(layer), .output = buffers.contextKv, .scratch = buffers.linearScratch},
                w.contextKv, linear.plan(w.contextKv, rows));
     ops::DraftAttention::addContextCommit(graph, buffers.contextKv, w.contextKeyNorm, buffers.ropeCos, buffers.ropeSin,

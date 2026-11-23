@@ -773,7 +773,7 @@ std::shared_ptr<const CompositeState> QwenStateStorage::adopt(const SlotRecord &
                                                               uint32_t tokens) {
   if (!file_)
     throw std::logic_error("Qwen states are taken back only from a disk tier");
-  const uint32_t window = std::min(tokens, ExecutionLimits::draftContextTokens);
+  const uint32_t window = std::min(tokens, layout_.draft.contextTokens);
   const QwenLogicalLengths lengths{tokens, tokens - window, window, tokens};
   validateLengths(lengths, true);
   if (record.payloadBytes != layout_.cachedBytes())
@@ -798,15 +798,12 @@ const QwenStateStorage::Lane &QwenStateStorage::lane(uint32_t index) const {
 
 void QwenStateStorage::validateLengths(const QwenLogicalLengths &lengths,
                                        bool cacheSnapshot) const {
-  if (lengths.draftLength > ExecutionLimits::draftContextTokens ||
-      lengths.draftEnd() > lengths.targetTokens ||
+  if (lengths.draftLength > layout_.draft.contextTokens || lengths.draftEnd() > lengths.targetTokens ||
       lengths.windowEnd > lengths.draftEnd()) {
     throw std::invalid_argument("invalid draft ring metadata");
   }
-  if (cacheSnapshot &&
-      (!lengths.targetTokens ||
-       !lengths.hasCompleteDraftWindow(ExecutionLimits::draftContextTokens) ||
-       lengths.targetTokens % kv::kPageTokens)) {
+  if (cacheSnapshot && (!lengths.targetTokens || !lengths.hasCompleteDraftWindow(layout_.draft.contextTokens) ||
+                        lengths.targetTokens % kv::kPageTokens)) {
     throw std::invalid_argument(
         "composite snapshot requires equal page-aligned committed lengths");
   }

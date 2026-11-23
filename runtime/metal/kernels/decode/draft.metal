@@ -153,7 +153,7 @@ kernel void draft_context_kv_commit(
   draft_context_kv_phase(
       context_kv + (ulong(lane_rows[batch].first) + ctz(path)) * RowWidth,
       k_norm, rope_cos + rope, rope_sin + rope, keys, values,
-      params.start_position[batch] + row, group.x % KVHeads, thread_index,
+      params.start_position[batch] + row, group.x % KVHeads, params.ring_tokens, thread_index,
       lane, simd_group, reductions, normalized);
 }
 
@@ -202,13 +202,13 @@ inline void draft_attention_split_phase(
     uint thread_index, uint lane, uint simd_group) {
   constexpr ushort M = SPLASH_DRAFT_ATTENTION_ROWS, N = 128,
                    D = SPLASH_DRAFT_HEAD_DIMENSION, TileK = 64;
-  constexpr uint Rows = SPLASH_DRAFT_QUERY_ROWS, Window = SPLASH_DRAFT_SLIDING_WINDOW,
-                 Splits = SPLASH_DRAFT_ATTENTION_SPLITS;
+  constexpr uint Rows = SPLASH_DRAFT_QUERY_ROWS, Splits = SPLASH_DRAFT_ATTENTION_SPLITS;
+  const uint Window = value_stride;
   // The earliest key any row sees: the first row's window's
   // (DraftAttentionBatchParams), which the ring holds (window < Window).
   uint common_start = cache_length >= window ? cache_length - window : 0;
   uint old_count = cache_length - common_start;
-  uint physical_start = common_start % Window;
+  uint physical_start = common_start & (Window - 1);
   // Live tiles: [0, wrapped) when the window wraps, then [resume, tail_end);
   // a tile the wrap and the tail both touch is visited once.
   uint physical_end = physical_start + old_count;
@@ -565,7 +565,7 @@ kernel void draft_attention_bf16_split(
   constexpr ulong Rows = SPLASH_DRAFT_QUERY_ROWS;
   constexpr ulong Attention = SPLASH_DRAFT_ATTENTION_WIDTH;
   constexpr ulong HeadDim = SPLASH_DRAFT_HEAD_DIMENSION;
-  constexpr ulong Window = SPLASH_DRAFT_SLIDING_WINDOW;
+  const ulong Window = params.value_stride;
   constexpr ulong PartialFloats = AttentionM * HeadDim + 2 * AttentionM;
   uint batch = group.y;
   device bfloat *keys = SPLASH_LANE_BINDING(batch, keys0, keys1, keys2, keys3, keys4, keys5, keys6, keys7);

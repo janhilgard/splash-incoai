@@ -1,5 +1,5 @@
 // Draft sliding-window attention against a direct CPU reference. The kernel
-// streams the 2048-slot ring in ring-aligned 128-token tiles over a fixed
+// streams the configured ring in ring-aligned 128-token tiles over a fixed
 // number of splits and combines their partials in split order; these cases
 // cover an unaligned wrap, a wrap that starts exactly one slot before the ring
 // end, the short prefix before any wrap, aligned wraps, windows that fill
@@ -60,7 +60,7 @@ StepRows stepOf(std::span<const LaneRows> lanes) {
 constexpr uint32_t kKvHeads = 8;
 constexpr uint32_t kQueryHeadsPerKv = 4;
 constexpr uint32_t kHeadDim = 128;
-constexpr uint32_t kWindow = 2048;
+constexpr uint32_t kWindow = SPLASH_DRAFT_SLIDING_WINDOW;
 constexpr uint32_t kLanes = SPLASH_MAXIMUM_BATCH_WIDTH;
 // The shipped split count and the fp32 partial one split leaves per (lane,
 // head) behind the grouped queries: 32 rows x (128 + max + sum).
@@ -499,10 +499,11 @@ void surroundingPhases(MetalBackend &backend, DraftAttentionShape shape,
 // its rows from a start position, the commit each lane's retained verify
 // rows (at most eight). The buffers hold exactly what the writers read.
 void contextWriters(MetalBackend &backend, DraftAttentionShape shape) {
+  const uint32_t ringTokens = shape.contextTokens;
   // A context row holds its keys, then its values.
   constexpr uint32_t kRowWidth = 2048, kKeyColumn = 0, kValueColumn = 1024;
   constexpr uint16_t kUntouched = 0xC2C2;
-  const uint64_t ringElements = uint64_t{kKvHeads} * kWindow * kHeadDim;
+  const uint64_t ringElements = uint64_t{kKvHeads} * ringTokens * kHeadDim;
   Random random(0xc0de0000ULL + shape.hiddenSize);
   const MetalBuffer keyNorm =
       randomBfloat(backend, kHeadDim, random, "draft key norm");
@@ -531,7 +532,7 @@ void contextWriters(MetalBackend &backend, DraftAttentionShape shape) {
     std::vector<uint16_t> wantValues(ringElements, kUntouched);
     std::vector<float> wantKeys(ringElements, NAN);
     for (uint32_t row = 0; row < rows; ++row) {
-      const uint32_t slot = (start + row) % kWindow;
+      const uint32_t slot = (start + row) % ringTokens;
       for (uint32_t head = 0; head < kKvHeads; ++head) {
         const uint16_t *key =
             kv + uint64_t{row} * kRowWidth + kKeyColumn + head * kHeadDim;
@@ -546,8 +547,7 @@ void contextWriters(MetalBackend &backend, DraftAttentionShape shape) {
         for (uint32_t d = 0; d < kHeadDim; ++d)
           normalized[d] = bf16ToFloat(
               floatToBf16(bf16ToFloat(key[d]) * inverse * bf16ToFloat(norm[d])));
-        float *out =
-            wantKeys.data() + (uint64_t{head} * kWindow + slot) * kHeadDim;
+        float *out = wantKeys.data() + (uint64_t{head} * ringTokens + slot) * kHeadDim;
         for (uint32_t d = 0; d < kHeadDim / 2; ++d) {
           const float c = cosines[uint64_t{row} * kHeadDim / 2 + d],
                       s = sines[uint64_t{row} * kHeadDim / 2 + d];
@@ -556,8 +556,7 @@ void contextWriters(MetalBackend &backend, DraftAttentionShape shape) {
               normalized[d + kHeadDim / 2] * c + normalized[d] * s;
         }
         for (uint32_t d = 0; d < kHeadDim; ++d)
-          wantValues[(uint64_t{head} * kHeadDim + d) * kWindow + slot] =
-              value[d];
+          wantValues[(uint64_t{head} * kHeadDim + d) * ringTokens + slot] = value[d];
       }
     }
     const auto *gotKeys = static_cast<const uint16_t *>(keys.contents());
@@ -651,9 +650,10 @@ void contextWriters(MetalBackend &backend, DraftAttentionShape shape) {
 // lane's RoPE rows are its verify block's, SPLASH_TARGET_VERIFY_ROWS a lane,
 // whichever rows it holds.
 void packedContextCommit(MetalBackend &backend, DraftAttentionShape shape) {
+  const uint32_t ringTokens = shape.contextTokens;
   constexpr uint32_t kRowWidth = 2048;
   constexpr uint16_t kUntouched = 0xC2C2;
-  const uint64_t ringElements = uint64_t{kKvHeads} * kWindow * kHeadDim;
+  const uint64_t ringElements = uint64_t{kKvHeads} * ringTokens * kHeadDim;
   Random random(0x7061636bULL + shape.hiddenSize);
   const std::array<LaneRows, kLanes> packed{{{0, 5}, {5, 8}, {13, 1}, {14, 6}, {20, 3}, {23, 2}, {25, 7}, {32, 4}}};
   const std::array<uint32_t, kLanes> starts{2044, 0, 4101, 300, 6140, 17, 1023, 8190},
@@ -710,7 +710,7 @@ void packedContextCommit(MetalBackend &backend, DraftAttentionShape shape) {
   // Lane 3 committed its six rows, clamped from nine, and lane 0 four of its
   // five: the slot after each lane's last keeps its bits.
   const auto touched = [&](const MetalBuffer &ring, uint32_t position) {
-    return static_cast<const uint16_t *>(ring.contents())[uint64_t{position % kWindow} * kHeadDim] != kUntouched;
+    return static_cast<const uint16_t *>(ring.contents())[uint64_t{position % ringTokens} * kHeadDim] != kUntouched;
   };
   require(touched(keys[3], starts[3] + 5) && !touched(keys[3], starts[3] + 6) && touched(keys[0], starts[0] + 3) &&
               !touched(keys[0], starts[0] + 4),
@@ -785,13 +785,14 @@ WindowGroup referenceWindowGroup(const uint16_t *values) {
 // codes, scales and minimums match the reference byte for byte, the loaded
 // rows bit for bit, and slots no store reached keep their bytes. The rows
 // hold a constant group (zero scale), a wide one and random ones.
-void contextWindow(MetalBackend &backend, uint32_t width) {
+void contextWindow(MetalBackend &backend, uint32_t width, uint32_t contextTokens = kWindow) {
   constexpr uint8_t kUntouched = 0xA5;
   const uint32_t groups = width / 64;
-  const uint64_t windowBytes = DraftAttention::contextWindowBytes(width);
-  require(windowBytes == uint64_t{kWindow} * (width / 2 + groups * 4), "context window bytes");
+  const uint64_t windowBytes = DraftAttention::contextWindowBytes(width, contextTokens);
+  require(windowBytes == uint64_t{contextTokens} * (width / 2 + groups * 4), "context window bytes");
   Random random(0xc0de1000ULL + width);
-  for (const auto [rows, start] : {std::pair{37U, 6130U}, std::pair{kWindow, 0U}}) {
+  for (const auto [rows, start] :
+       {std::pair{37U, 6130U}, std::pair{contextTokens, 0U}, std::pair{contextTokens - 13, contextTokens - 17}}) {
     const MetalBuffer input = randomBfloat(backend, uint64_t{rows} * width, random, "draft context rows");
     auto *values = static_cast<uint16_t *>(input.contents());
     std::fill_n(values, 64, floatToBf16(0.75F));
@@ -801,22 +802,33 @@ void contextWindow(MetalBackend &backend, uint32_t width) {
     std::memset(window.contents(), kUntouched, windowBytes);
     MetalBuffer loaded = backend.allocateBuffer(uint64_t{rows} * width * 2, BufferStorage::Shared,
                                                 "draft context loaded rows");
+    MetalBuffer chunked = backend.allocateBuffer(uint64_t{rows} * width * 2, BufferStorage::Shared,
+                                                 "draft context loaded in prefill chunks");
     constexpr uint32_t kRunBegin = 5, kRunRows = 16;
     MetalBuffer run = backend.allocateBuffer(uint64_t{kRunRows} * width * 2, BufferStorage::Shared,
                                              "draft context loaded run");
     CommandGraph graph;
-    DraftAttention::addWindowStore(graph, input, window, rows, start, width);
-    DraftAttention::addWindowLoad(graph, window, loaded, rows, start, width);
-    DraftAttention::addWindowLoad(graph, window, run, kRunRows, start + kRunBegin, width);
+    DraftAttention::addWindowStore(graph, input, window, rows, start, width, contextTokens);
+    DraftAttention::addWindowLoad(graph, window, loaded, rows, start, width, contextTokens);
+    for (uint32_t offset = 0; offset < rows; offset += SPLASH_PREFILL_TOKEN_BUDGET) {
+      const uint32_t count = std::min(rows - offset, SPLASH_PREFILL_TOKEN_BUDGET);
+      DraftAttention::addWindowLoad(graph, window,
+                                    backend.view(chunked, uint64_t{offset} * width * 2, uint64_t{count} * width * 2),
+                                    count, start + offset, width, contextTokens);
+    }
+    DraftAttention::addWindowLoad(graph, window, run, kRunRows, start + kRunBegin, width, contextTokens);
     static_cast<void>(backend.submitCommandAsync(graph.dispatches()).wait());
 
+    require(std::memcmp(loaded.contents(), chunked.contents(), uint64_t{rows} * width * 2) == 0,
+            "chunked draft restore changed rows or absolute ring positions");
+
     const auto *bytes = static_cast<const uint8_t *>(window.contents());
-    const auto *scales = reinterpret_cast<const _Float16 *>(bytes + uint64_t{kWindow} * (width / 2));
+    const auto *scales = reinterpret_cast<const _Float16 *>(bytes + uint64_t{contextTokens} * (width / 2));
     const auto *loadedValues = static_cast<const uint16_t *>(loaded.contents());
     const auto *runValues = static_cast<const uint16_t *>(run.contents());
-    std::vector<bool> written(kWindow);
+    std::vector<bool> written(contextTokens);
     for (uint32_t row = 0; row < rows; ++row) {
-      const uint32_t slot = (start + row) % kWindow;
+      const uint32_t slot = (start + row) % contextTokens;
       written[slot] = true;
       for (uint32_t group = 0; group < groups; ++group) {
         const uint64_t offset = uint64_t{row} * width + group * 64;
@@ -836,7 +848,7 @@ void contextWindow(MetalBackend &backend, uint32_t width) {
                   "context window loaded run");
       }
     }
-    for (uint32_t slot = 0; slot < kWindow; ++slot) {
+    for (uint32_t slot = 0; slot < contextTokens; ++slot) {
       if (written[slot]) continue;
       const uint8_t *codes = bytes + uint64_t{slot} * (width / 2);
       const auto *groupBytes = reinterpret_cast<const uint8_t *>(scales + uint64_t{slot} * groups * 2);
@@ -846,11 +858,12 @@ void contextWindow(MetalBackend &backend, uint32_t width) {
     }
   }
   CommandGraph invalid;
-  const MetalBuffer rows = backend.allocateBuffer(uint64_t{kWindow + 1} * width * 2, BufferStorage::Shared, "rows");
+  const MetalBuffer rows =
+      backend.allocateBuffer(uint64_t{contextTokens + 1} * width * 2, BufferStorage::Shared, "rows");
   const MetalBuffer window = backend.allocateBuffer(windowBytes, BufferStorage::Shared, "window");
-  rejects([&] { DraftAttention::addWindowStore(invalid, rows, window, 0, 0, width); },
+  rejects([&] { DraftAttention::addWindowStore(invalid, rows, window, 0, 0, width, contextTokens); },
           "a context window holds one ring's rows", "an empty context window store was accepted");
-  rejects([&] { DraftAttention::addWindowLoad(invalid, window, rows, kWindow + 1, 0, width); },
+  rejects([&] { DraftAttention::addWindowLoad(invalid, window, rows, contextTokens + 1, 0, width, contextTokens); },
           "a context window holds one ring's rows", "a load of more rows than a ring was accepted");
   rejects([&] { static_cast<void>(DraftAttention::contextWindowBytes(width + 32)); },
           "draft context rows are whole 64-value groups", "a partial context group was accepted");
@@ -864,9 +877,9 @@ void contextWindow(MetalBackend &backend, uint32_t width) {
 // of every chain's first rows, and none, and of a tree's path, rows 0, 2, 5
 // and 6, for every k, the whole path (a cycle's commit) and fewer of its rows
 // (a capture whose page boundary falls inside the path).
-void contextWindowCommit(MetalBackend &backend, uint32_t width) {
-  constexpr uint32_t start = kWindow - 4, first = 2, stepRows = first + kRows;
-  const uint64_t windowBytes = DraftAttention::contextWindowBytes(width);
+void contextWindowCommit(MetalBackend &backend, uint32_t width, uint32_t contextTokens = kWindow) {
+  const uint32_t start = contextTokens - 4, first = 2, stepRows = first + kRows;
+  const uint64_t windowBytes = DraftAttention::contextWindowBytes(width, contextTokens);
   Random random(0xc0de3000ULL + width);
   const MetalBuffer rows = randomBfloat(backend, uint64_t{stepRows} * width, random, "draft context rows");
   const MetalBuffer retained = backend.allocateBuffer(4, BufferStorage::Shared, "draft retained rows");
@@ -899,9 +912,10 @@ void contextWindowCommit(MetalBackend &backend, uint32_t width) {
       std::memset(stored.contents(), 0xA5, windowBytes);
       const uint32_t kept = std::min(k, count);
       CommandGraph graph;
-      DraftAttention::addWindowCommit(graph, rows, committed, retained, laneRows, stepRows, k, start, width);
+      DraftAttention::addWindowCommit(graph, rows, committed, retained, laneRows, stepRows, k, start, width,
+                                      contextTokens);
       if (kept)
-        DraftAttention::addWindowStore(graph, gathered, stored, kept, start, width);
+        DraftAttention::addWindowStore(graph, gathered, stored, kept, start, width, contextTokens);
       static_cast<void>(backend.submitCommandAsync(graph.dispatches()).wait());
       require(std::memcmp(committed.contents(), stored.contents(), windowBytes) == 0,
               "a window commit of the first " + std::to_string(k) + " of retained rows " + std::to_string(path) +
@@ -913,19 +927,21 @@ void contextWindowCommit(MetalBackend &backend, uint32_t width) {
 // A state captured at s inside a command over [a, b) starts from the lane's
 // window as the command finds it, copied, and stores the command's rows
 // [a, s) into it as the lane's window takes them: the slots of its positions
-// [s - 2048, s) are, byte for byte, those one store of those rows leaves,
+// [s - window, s) are, byte for byte, those one store of those rows leaves,
 // while the lane's window, which goes on to rows [s, b), has lost the oldest
-// once b passes 2048. Before the window fills and once the ring wraps.
-void contextWindowCapturedInside(MetalBackend &backend, uint32_t width) {
-  const uint64_t windowBytes = DraftAttention::contextWindowBytes(width);
+// once b passes the window. Before the window fills and once the ring wraps.
+void contextWindowCapturedInside(MetalBackend &backend, uint32_t width, uint32_t contextTokens = kWindow) {
+  const uint64_t windowBytes = DraftAttention::contextWindowBytes(width, contextTokens);
   const uint64_t rowBytes = uint64_t{width} * 2;
   const uint64_t codeBytes = width / 2, groupBytes = width / 64 * 4;
   Random random(0xc0de2000ULL + width);
-  for (const auto [a, s, b] : {std::array{1000U, 1500U, 2900U}, std::array{5000U, 5500U, 6900U}}) {
+  for (const auto [a, s, b] :
+       {std::array{contextTokens - 1048, contextTokens - 548, contextTokens + 852},
+        std::array{2 * contextTokens + 904, 2 * contextTokens + 1404, 3 * contextTokens + 756}}) {
     const MetalBuffer rows = randomBfloat(backend, uint64_t{b} * width, random, "draft context rows");
     const auto store = [&](CommandGraph &graph, uint32_t begin, uint32_t end, const MetalBuffer &window) {
-      DraftAttention::addWindowStore(graph, backend.view(rows, begin * rowBytes, (end - begin) * rowBytes),
-                                     window, end - begin, begin, width);
+      DraftAttention::addWindowStore(graph, backend.view(rows, begin * rowBytes, (end - begin) * rowBytes), window,
+                                     end - begin, begin, width, contextTokens);
     };
     const auto allocate = [&](const char *label) {
       MetalBuffer window = backend.allocateBuffer(windowBytes, BufferStorage::Shared, label);
@@ -934,7 +950,7 @@ void contextWindowCapturedInside(MetalBackend &backend, uint32_t width) {
     };
     const MetalBuffer lane = allocate("lane window"), captured = allocate("captured window"), whole = allocate("whole window");
     CommandGraph earlier;
-    store(earlier, a - std::min(a, kWindow), a, lane);
+    store(earlier, a - std::min(a, contextTokens), a, lane);
     static_cast<void>(backend.submitCommandAsync(earlier.dispatches()).wait());
     std::memcpy(captured.contents(), lane.contents(), windowBytes);
     const std::vector<uint8_t> before(static_cast<const uint8_t *>(lane.contents()),
@@ -942,22 +958,22 @@ void contextWindowCapturedInside(MetalBackend &backend, uint32_t width) {
     CommandGraph command, reference;
     store(command, a, b, lane);
     store(command, a, s, captured);
-    store(reference, s - std::min(s, kWindow), s, whole);
+    store(reference, s - std::min(s, contextTokens), s, whole);
     static_cast<void>(backend.submitCommandAsync(command.dispatches()).wait());
     static_cast<void>(backend.submitCommandAsync(reference.dispatches()).wait());
     const auto slot = [&](const void *window, uint64_t position, bool codes) {
-      const uint64_t index = position % kWindow;
+      const uint64_t index = position % contextTokens;
       return static_cast<const uint8_t *>(window) +
-             (codes ? index * codeBytes : kWindow * codeBytes + index * groupBytes);
+             (codes ? index * codeBytes : contextTokens * codeBytes + index * groupBytes);
     };
     uint64_t lost = 0;
-    for (uint64_t position = s - std::min(s, kWindow); position < s; ++position)
+    for (uint64_t position = s - std::min(s, contextTokens); position < s; ++position)
       for (const bool codes : {true, false}) {
         const uint64_t bytes = codes ? codeBytes : groupBytes;
         require(std::memcmp(slot(captured.contents(), position, codes), slot(whole.contents(), position, codes),
                             bytes) == 0,
                 "a captured window's slot is not the one a store of its rows leaves");
-        if (position + kWindow < b) {
+        if (position + contextTokens < b) {
           require(std::memcmp(slot(captured.contents(), position, codes), slot(before.data(), position, codes),
                               bytes) == 0,
                   "a captured window's overwritten slot is not the lane's before the command");
@@ -1114,6 +1130,12 @@ int main(int argc, char **argv) {
       runCase(backend, 2, shape, {8191, 262144, 0, 0});
       runCase(backend, kLanes, shape, {262137, 4094, 500, 6143, 512, 2049, 0, 8191});
     }
+    const DraftAttentionShape dspark{2304, 0, 5120, 3072, 24, 8, 128, SPLASH_DSPARK_CONTEXT_TOKENS};
+    contextWriters(backend, dspark);
+    packedContextCommit(backend, dspark);
+    contextWindow(backend, 2304, SPLASH_DSPARK_CONTEXT_TOKENS);
+    contextWindowCapturedInside(backend, 2304, SPLASH_DSPARK_CONTEXT_TOKENS);
+    contextWindowCommit(backend, 2304, SPLASH_DSPARK_CONTEXT_TOKENS);
     std::cout << "draft_attention_metal_test: PASS\n";
     return 0;
   } catch (const std::exception &error) {

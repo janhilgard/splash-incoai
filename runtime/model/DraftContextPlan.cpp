@@ -4,9 +4,11 @@
 #include <stdexcept>
 
 namespace splash {
-DraftContextPlan
-planDraftContext(uint32_t replayBegin, uint32_t replayEnd,
-                 std::span<const uint32_t> materializationBoundaries) {
+DraftContextPlan planDraftContext(uint32_t replayBegin, uint32_t replayEnd,
+                                  std::span<const uint32_t> materializationBoundaries, uint32_t windowTokens) {
+  if (windowTokens < model::ExecutionLimits::prefillTokenBudget || (windowTokens & (windowTokens - 1)))
+    throw std::invalid_argument("draft context must be a power of two at least "
+                                "as large as a prefill chunk");
   if (replayEnd < replayBegin) {
     throw std::invalid_argument("draft replay range is reversed");
   }
@@ -29,8 +31,9 @@ planDraftContext(uint32_t replayBegin, uint32_t replayEnd,
   DraftContextPlan result;
   result.replayBegin = replayBegin;
   result.replayEnd = replayEnd;
+  result.windowTokens = windowTokens;
 
-  constexpr uint32_t window = model::ExecutionLimits::draftContextTokens;
+  const uint32_t window = windowTokens;
   uint32_t stateBoundary = replayBegin;
   bool haveState = replayBegin != 0;
 

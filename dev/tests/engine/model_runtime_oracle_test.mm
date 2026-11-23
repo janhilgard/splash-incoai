@@ -469,7 +469,7 @@ CommittedState committedState(const model::Runtime &executor, const model::QwenS
   // A ring's keys are [head][slot][dimension] and its values [head][dimension]
   // [slot]; position p is slot p % window.
   const auto layout = states.layout().draft;
-  constexpr uint32_t window = model::ExecutionLimits::draftContextTokens;
+  const uint32_t window = layout.contextTokens;
   for (const auto &ring : states.draft(lane)) {
     const uint16_t *keys = bfloatContents(ring.keys, "draft keys");
     const uint16_t *values = bfloatContents(ring.values, "draft values");
@@ -580,7 +580,7 @@ void restoreActivePrefix(model::Runtime &executor, uint64_t requestId,
                          const std::shared_ptr<const CompositeState> &state) {
   require(!executor.beginRestore(requestId, boundary, state, true, {}),
           "resident restore returned a read");
-  executor.setDraftContextPlan(requestId, planDraftContext(boundary, promptTokens, {}));
+  executor.setDraftContextPlan(requestId, planDraftContext(boundary, promptTokens, {}, executor.draftContextTokens()));
 }
 
 // Passes a lane's GDN state through the codes a cached state stores it as
@@ -882,7 +882,7 @@ StateSamples sampleCommittedState(const metal::MetalBackend &backend,
   }
   const auto &lengths = states.metadata(lane).lengths;
   const auto layout = states.layout().draft;
-  constexpr uint32_t window = model::ExecutionLimits::draftContextTokens;
+  const uint32_t window = layout.contextTokens;
   const uint64_t elements = uint64_t{layout.kvHeads} * lengths.draftLength *
                             layout.headDimension;
   const uint64_t stride = std::max<uint64_t>(1, elements / 65536);
@@ -1122,7 +1122,7 @@ void requireImageRowsAfterReclaim(model::Runtime &executor,
   const StateAdmission admission = executor.begin(request.modelView());
   require(admission.granted(), "straddling image request was not admitted");
   executor.setDraftContextPlan(
-      request.id, planDraftContext(0, static_cast<uint32_t>(prompt.size()), {}));
+      request.id, planDraftContext(0, static_cast<uint32_t>(prompt.size()), {}, executor.draftContextTokens()));
   prefillChunk(executor, request.id, 0,
                std::span<const uint32_t>(prompt).first(64), pages, ImageEncodes{backend, true});
   const ImageSpan &span = request.images.front();
@@ -1256,7 +1256,8 @@ void requireRepeatedImagePlacements(model::Runtime &executor,
   const uint32_t lane = *admitted.lane;
   const std::vector<uint32_t> pages = pageRange(120, 4);
   const std::array<uint32_t, 1> checkpoints{64};
-  executor.setDraftContextPlan(request.id, planDraftContext(0, prompt.size(), checkpoints));
+  executor.setDraftContextPlan(request.id,
+                               planDraftContext(0, prompt.size(), checkpoints, executor.draftContextTokens()));
   const uint64_t encodes = executor.telemetry().imageEncodes;
   prefillChunk(executor, request.id, 0,
                std::span<const uint32_t>(prompt).first(64), pages, ImageEncodes{backend, true});
@@ -1312,7 +1313,8 @@ void requireFullWindowRestore(model::Runtime &executor,
   EngineRequest request = makeRequest(104, prompt, 1);
   beginCold(executor, request, 0);
   const std::array<uint32_t, 1> checkpoints{boundary};
-  executor.setDraftContextPlan(request.id, planDraftContext(0, prompt.size(), checkpoints));
+  executor.setDraftContextPlan(request.id,
+                               planDraftContext(0, prompt.size(), checkpoints, executor.draftContextTokens()));
   prefillChunk(executor, request.id, 0, tokens.first(window), pages);
   prefillChunk(executor, request.id, window, tokens.subspan(window, boundary - window), pages);
   auto checkpoint = executor.snapshot(request.id);
@@ -1347,7 +1349,7 @@ StateBytes restoredBytes(model::Runtime &executor, const model::QwenStateStorage
                          uint32_t boundary, const std::shared_ptr<const CompositeState> &state) {
   beginCold(executor, makeRequest(probe, {prompt.begin(), prompt.end()}, 1), lane);
   require(!executor.beginRestore(probe, boundary, state, true, {}), "resident restore returned a read");
-  const uint32_t window = std::min(boundary, model::ExecutionLimits::draftContextTokens);
+  const uint32_t window = std::min(boundary, states.layout().draft.contextTokens);
   require(states.metadata(lane).lengths ==
               model::QwenLogicalLengths{boundary, boundary - window, window, boundary},
           "a captured state's lengths are not those of its boundary");
@@ -1466,14 +1468,14 @@ void requireStatesCapturedInsideCommands(model::Runtime &executor, const metal::
   };
 
   beginCold(executor, scoring(401, shorter), 0);
-  executor.setDraftContextPlan(401, planDraftContext(0, end, boundaries));
+  executor.setDraftContextPlan(401, planDraftContext(0, end, boundaries, executor.draftContextTokens()));
   prefill(401, 0, shorter.first(split), plainPages);
   const auto [plain, plainSplit] = prefill(401, split, shorter.subspan(split), plainPages);
   // A score request, which no decode cycle reads a lookup index of, has
   // none.
   requireLookupIndex(executor, 401, {}, "a score request's prompt");
   beginCold(executor, scoring(402, shorter), 1);
-  executor.setDraftContextPlan(402, planDraftContext(0, end, boundaries));
+  executor.setDraftContextPlan(402, planDraftContext(0, end, boundaries, executor.draftContextTokens()));
   prefill(402, 0, shorter.first(split), capturingPages);
   const std::vector<uint8_t> before = bytesOf(states.window(1));
   // A fault armed for an evaluation past these stops the split inside the
@@ -1519,7 +1521,8 @@ void requireStatesCapturedInsideCommands(model::Runtime &executor, const metal::
   beginCold(executor, scoring(403, tokens), 2);
   restoreActivePrefix(executor, 403, longer, secondCaptured, capturing.capturedStates[1]);
   const std::array<uint32_t, 1> resumedBoundary{end};
-  executor.setDraftContextPlan(403, planDraftContext(secondCaptured, longer, resumedBoundary));
+  executor.setDraftContextPlan(
+      403, planDraftContext(secondCaptured, longer, resumedBoundary, executor.draftContextTokens()));
   const std::vector<uint8_t> resumedBefore = bytesOf(states.window(2));
   const ModelStepResult resumed =
       prefill(403, secondCaptured, tokens.subspan(secondCaptured), resumedPages, resumedBoundary).first;
@@ -1532,7 +1535,7 @@ void requireStatesCapturedInsideCommands(model::Runtime &executor, const metal::
   // The same restore from the state of commands that ended at 1024 and
   // 2080, where a bf16 state was rounded as the captured states rounded it.
   beginCold(executor, makeRequest(404, prompt, 1), 0);
-  executor.setDraftContextPlan(404, planDraftContext(0, longer, boundaries));
+  executor.setDraftContextPlan(404, planDraftContext(0, longer, boundaries, executor.draftContextTokens()));
   const std::vector<uint32_t> teacherPages = table({prefix, pageRange(15, 50)});
   prefill(404, 0, tokens.first(split), teacherPages);
   const bool teacherSplit = prefill(404, split, tokens.subspan(split, firstCaptured - split), teacherPages).second;
@@ -1563,7 +1566,8 @@ void requireStatesCapturedInsideCommands(model::Runtime &executor, const metal::
   };
   const auto [capturedConvolution, capturedRecurrent] = similar(0, 3);
   executor.end(410);
-  executor.setDraftContextPlan(405, planDraftContext(secondCaptured, longer, resumedBoundary));
+  executor.setDraftContextPlan(
+      405, planDraftContext(secondCaptured, longer, resumedBoundary, executor.draftContextTokens()));
   const ModelStepResult fromEnded =
       prefill(405, secondCaptured, tokens.subspan(secondCaptured), table({teacherPages, {119, 120}}), resumedBoundary)
           .first;
@@ -1659,7 +1663,7 @@ void requirePrefillGroupMatchesItsChunks(model::Runtime &executor, const kv::Pag
   // Every captured state holds a whole draft window (planDraftContext).
   const auto start = [&](uint64_t id, bool image) {
     beginCold(executor, image ? withImage(scoring(id)) : scoring(id), 0);
-    executor.setDraftContextPlan(id, planDraftContext(0, rows, capturedAt));
+    executor.setDraftContextPlan(id, planDraftContext(0, rows, capturedAt, executor.draftContextTokens()));
   };
   const uint32_t width = states.layout().draft.contextWidth;
   const auto oneLane = [&](bool image) {
@@ -1765,7 +1769,7 @@ void requirePrefillGroupMatchesItsChunks(model::Runtime &executor, const kv::Pag
       EngineRequest request = makeRequest(ids[lane], {prompt.begin(), prompt.begin() + laneRows}, 0);
       request.scoreTokens = scoring(ids[lane]).scoreTokens;
       beginCold(executor, request, lane);
-      executor.setDraftContextPlan(ids[lane], planDraftContext(0, laneRows, {}));
+      executor.setDraftContextPlan(ids[lane], planDraftContext(0, laneRows, {}, executor.draftContextTokens()));
     }
   };
   startLanes({511, 512});
@@ -1854,7 +1858,7 @@ void requirePrefillPassesMatchWhole(model::Runtime &executor, const kv::PageStor
         request.imagePixels[index] = static_cast<uint8_t>(index * 13 + 7);
     }
     beginCold(executor, request, 0);
-    executor.setDraftContextPlan(id, planDraftContext(0, rows, capturedAt));
+    executor.setDraftContextPlan(id, planDraftContext(0, rows, capturedAt, executor.draftContextTokens()));
     ModelStepResult last;
     {
       ModelBatchItem item = withRevision({id, 0, rows, pageTable});
@@ -1944,7 +1948,8 @@ void requirePrefillPassesMatchWhole(model::Runtime &executor, const kv::PageStor
       for (uint32_t option = 0; option < model::ExecutionLimits::maximumScoreOptions; ++option)
         request.scoreTokens.push_back(1000 + 37 * option);
       beginCold(executor, request, lane);
-      executor.setDraftContextPlan(ids[lane], planDraftContext(0, laneRows, laneCaptures[lane]));
+      executor.setDraftContextPlan(ids[lane],
+                                   planDraftContext(0, laneRows, laneCaptures[lane], executor.draftContextTokens()));
       plan.items.push_back({ids[lane], laneRows});
       ModelBatchItem item = withRevision({ids[lane], 0, laneRows, lanePages[lane]});
       item.inputTokens = tokens.first(laneRows);
@@ -2094,7 +2099,8 @@ void requireCapturesOutliveTheirItems(model::Runtime &executor,
   const std::vector<uint32_t> secondPages = pageRange(120, tokens / kv::kPageTokens);
   const auto submit = [&](uint64_t id, const std::vector<uint32_t> &pages) {
     beginCold(executor, makeRequest(id, prompt, 1), 0);
-    executor.setDraftContextPlan(id, planDraftContext(0, tokens, std::span(boundaries).first(1)));
+    executor.setDraftContextPlan(
+        id, planDraftContext(0, tokens, std::span(boundaries).first(1), executor.draftContextTokens()));
     ModelBatchItem item = withRevision({id, 0, tokens, pages});
     item.inputTokens = prompt;
     for (const uint32_t boundary : boundaries) {
@@ -2170,7 +2176,7 @@ void requireDecodeCaptureMatchesTheLane(model::Runtime &executor, model::QwenSta
     EngineRequest request = makeRequest(id, tokens, 64);
     request.flags = RequestIgnoreEndOfSequence;
     beginCold(executor, request, 0);
-    executor.setDraftContextPlan(id, planDraftContext(0, length, {}));
+    executor.setDraftContextPlan(id, planDraftContext(0, length, {}, executor.draftContextTokens()));
     const ModelStepResult prefilled = prefillChunk(executor, id, 0, tokens, decodePages);
     require(prefilled.failure.empty() && prefilled.outputTokens.empty(),
             "a decode capture's prompt ended right after prefill");
@@ -2274,7 +2280,7 @@ void requireDecodeCaptureMatchesTheLane(model::Runtime &executor, model::QwenSta
 
   // For the record: a prefill of the same tokens captured at the same page.
   beginCold(executor, makeRequest(431, through, 1), 1);
-  executor.setDraftContextPlan(431, planDraftContext(0, boundary, {}));
+  executor.setDraftContextPlan(431, planDraftContext(0, boundary, {}, executor.draftContextTokens()));
   requireOpen(prefillChunk(executor, 431, 0, std::span(through).first(prompt), prefillPages), "decode capture");
   const std::array<uint32_t, 1> end{boundary};
   ModelStepResult rest =
@@ -2323,7 +2329,7 @@ FirstCycle runFirstCycle(model::Runtime &executor, const model::QwenStateStorage
   if (ignoreEnd)
     request.flags = RequestIgnoreEndOfSequence;
   beginCold(executor, request, 0);
-  executor.setDraftContextPlan(id, planDraftContext(0, length, {}));
+  executor.setDraftContextPlan(id, planDraftContext(0, length, {}, executor.draftContextTokens()));
   const ModelStepResult prefilled = prefillChunk(executor, id, 0, tokens, pages);
   require(prefilled.failure.empty() && prefilled.outputTokens.empty(),
           "a first cycle's prompt ended right after prefill");
@@ -2448,7 +2454,7 @@ void requireCacheHitMatchesCold(model::Runtime &executor, std::span<const uint32
   };
   beginCold(executor, makeRequest(2800, prompt, 1), 0);
   const std::array<uint32_t, 1> boundary{kBoundary};
-  executor.setDraftContextPlan(2800, planDraftContext(0, kLength, boundary));
+  executor.setDraftContextPlan(2800, planDraftContext(0, kLength, boundary, executor.draftContextTokens()));
   ModelStepResult first = prefillChunk(executor, 2800, 0, tokens.first(kBoundary), coldPages, {}, boundary);
   require(first.failure.empty() && first.capturedStates.size() == 1, "the cold prefill captured no state");
   const std::shared_ptr<const CompositeState> state = first.capturedStates.front();
@@ -2476,7 +2482,7 @@ void requireCacheHitMatchesCold(model::Runtime &executor, std::span<const uint32
     std::this_thread::yield();
   require(read->finish(), "a restore from the disk tier failed");
   read.reset();
-  executor.setDraftContextPlan(2802, planDraftContext(kBoundary, kLength, {}));
+  executor.setDraftContextPlan(2802, planDraftContext(kBoundary, kLength, {}, executor.draftContextTokens()));
   prefillChunk(executor, 2802, kBoundary, tokens.subspan(kBoundary), hitPages(44));
   const std::vector<float> fromDisk = lastLogits();
   executor.end(2802);
@@ -3146,8 +3152,8 @@ void requireConcurrentRequestsShareOneEncode(model::Runtime &executor,
   const std::array<std::vector<uint32_t>, 2> pages{pageRange(116, 4), pageRange(120, 4)};
   for (uint32_t lane = 0; lane < 2; ++lane) {
     const EngineRequest &request = lane ? second : first;
-    executor.setDraftContextPlan(
-        request.id, planDraftContext(0, static_cast<uint32_t>(request.prompt.size()), {}));
+    executor.setDraftContextPlan(request.id, planDraftContext(0, static_cast<uint32_t>(request.prompt.size()), {},
+                                                              executor.draftContextTokens()));
     const auto tokens = static_cast<uint32_t>(request.prompt.size());
     plan.items.push_back({request.id, tokens});
     items[lane] =
@@ -3252,14 +3258,14 @@ void requireSuspendedLaneKeepsItsRows(model::Runtime &executor,
   const StateAdmission admission = executor.begin(request.modelView());
   require(admission.granted(), "suspended image request was not admitted");
   executor.setDraftContextPlan(
-      request.id, planDraftContext(0, static_cast<uint32_t>(prompt.size()), {}));
+      request.id, planDraftContext(0, static_cast<uint32_t>(prompt.size()), {}, executor.draftContextTokens()));
   const uint64_t encodes = executor.telemetry().imageEncodes;
   prefillChunk(executor, request.id, 0, prompt.first(32), pages, ImageEncodes{backend, true});
   executor.suspend(request.id);
   const StateAdmission resumed = executor.resume(request.modelView());
   require(resumed.granted(), "suspended image request did not resume");
   executor.setDraftContextPlan(
-      request.id, planDraftContext(0, static_cast<uint32_t>(prompt.size()), {}));
+      request.id, planDraftContext(0, static_cast<uint32_t>(prompt.size()), {}, executor.draftContextTokens()));
   prefillChunk(executor, request.id, 0, prompt, pages, ImageEncodes{backend, false});
   require(executor.telemetry().imageEncodes == encodes + 1,
           "a resumed lane encoded its image again");
@@ -3280,7 +3286,7 @@ void requireInjectedRowsBecomeReclaimable(model::Runtime &executor,
   const StateAdmission admission = executor.begin(request.modelView());
   require(admission.granted(), "reclaimable image request was not admitted");
   executor.setDraftContextPlan(
-      request.id, planDraftContext(0, static_cast<uint32_t>(request.prompt.size()), {}));
+      request.id, planDraftContext(0, static_cast<uint32_t>(request.prompt.size()), {}, executor.draftContextTokens()));
   prefillChunk(executor, request.id, 0, request.prompt, pageRange(120, 4),
                ImageEncodes{backend, true});
   const model::ModelTelemetry injected = executor.telemetry();
@@ -3319,7 +3325,8 @@ void requireCoveredImagesAreNotStaged(model::Runtime &executor,
   const StateAdmission producer = executor.begin(request.modelView());
   require(producer.granted(), "covered image producer was not admitted");
   const std::array<uint32_t, 2> checkpoints{32, 64};
-  executor.setDraftContextPlan(request.id, planDraftContext(0, prompt.size(), checkpoints));
+  executor.setDraftContextPlan(request.id,
+                               planDraftContext(0, prompt.size(), checkpoints, executor.draftContextTokens()));
   prefillChunk(executor, request.id, 0, std::span<const uint32_t>(prompt).first(32), pages);
   std::shared_ptr<const CompositeState> beforeImage = executor.snapshot(request.id);
   prefillChunk(executor, request.id, 32,
@@ -3395,7 +3402,7 @@ void requireRefusedStartKeepsItsRows(model::Runtime &executor,
   const std::vector<uint32_t> pages = pageRange(120, 4);
   const StateAdmission admitted = executor.begin(cached.modelView());
   require(admitted.granted(), "refused-start fixture was not admitted");
-  executor.setDraftContextPlan(cached.id, planDraftContext(0, prompt.size(), {}));
+  executor.setDraftContextPlan(cached.id, planDraftContext(0, prompt.size(), {}, executor.draftContextTokens()));
   prefillChunk(executor, cached.id, 0,
                std::span<const uint32_t>(prompt).first(64), pages, ImageEncodes{backend, true});
 
@@ -3478,7 +3485,7 @@ void requirePoolReleaseTakesOneUnit(model::Runtime &executor,
     request.imagePixels[index] = static_cast<uint8_t>(index * 9 + 4);
   const StateAdmission admission = executor.begin(request.modelView());
   require(admission.granted(), "two-image request was not admitted");
-  executor.setDraftContextPlan(request.id, planDraftContext(0, prompt.size(), {}));
+  executor.setDraftContextPlan(request.id, planDraftContext(0, prompt.size(), {}, executor.draftContextTokens()));
   prefillChunk(executor, request.id, 0, prompt, pageRange(120, 4), ImageEncodes{backend, true});
   executor.end(request.id);
   while (executor.releaseIdleBuffer(false)) {
@@ -3530,8 +3537,8 @@ void requireEncoderFitsItsImages(model::Runtime &executor,
           "a larger image did not replace the smaller encoder");
   const uint64_t encodes = executor.telemetry().imageEncodes;
   for (const EngineRequest *request : {&small, &smaller, &large}) {
-    executor.setDraftContextPlan(
-        request->id, planDraftContext(0, static_cast<uint32_t>(request->prompt.size()), {}));
+    executor.setDraftContextPlan(request->id, planDraftContext(0, static_cast<uint32_t>(request->prompt.size()), {},
+                                                               executor.draftContextTokens()));
     prefillChunk(executor, request->id, 0, request->prompt, pageRange(120, 4));
     executor.end(request->id);
   }
@@ -3581,7 +3588,7 @@ void requireReplayPointKeepsItsImageRows(model::Runtime &executor,
   const StateAdmission first = executor.begin(request.modelView());
   require(first.granted(), "replay point image request was not admitted");
   const std::array<uint32_t, 1> boundary{64};
-  executor.setDraftContextPlan(request.id, planDraftContext(0, prompt.size(), boundary));
+  executor.setDraftContextPlan(request.id, planDraftContext(0, prompt.size(), boundary, executor.draftContextTokens()));
   prefillChunk(executor, request.id, 0,
                std::span<const uint32_t>(prompt).first(64), pages, ImageEncodes{backend, true});
   std::shared_ptr<const CompositeState> replayPoint = executor.snapshot(request.id);
@@ -3637,7 +3644,7 @@ void requireCapturedStateKeepsItsImageRows(model::Runtime &executor,
   const std::vector<uint32_t> pages = pageRange(120, 4);
   require(executor.begin(request.modelView()).granted(), "captured state image request was not admitted");
   const std::array<uint32_t, 1> boundary{64};
-  executor.setDraftContextPlan(request.id, planDraftContext(0, prompt.size(), boundary));
+  executor.setDraftContextPlan(request.id, planDraftContext(0, prompt.size(), boundary, executor.draftContextTokens()));
   std::shared_ptr<const CompositeState> captured =
       prefillChunk(executor, request.id, 0, prompt, pages, ImageEncodes{backend, true}, boundary)
           .capturedStates.front();
@@ -7298,8 +7305,7 @@ int main(int argc, char **argv) {
     beginCold(executor, request, 0);
     prefillChunk(executor, 1, 0, prompt128, pageTable);
     require(states.metadata(0).lengths.targetTokens == 128 &&
-                states.metadata(0).lengths.hasCompleteDraftWindow(
-                    model::ExecutionLimits::draftContextTokens),
+                states.metadata(0).lengths.hasCompleteDraftWindow(executor.draftContextTokens()),
             "prefill state length mismatch");
 
     const uint64_t predictedPromptSnapshotBytes =
@@ -7318,10 +7324,8 @@ int main(int argc, char **argv) {
                 beforeFirstDecode + 1,
             "speculative verify and commit were not one Metal command");
     require(!decoded.outputTokens.empty(), "decode produced no tokens");
-    require(states.metadata(0).lengths.targetTokens ==
-                    128 + decoded.outputTokens.size() &&
-                states.metadata(0).lengths.hasCompleteDraftWindow(
-                    model::ExecutionLimits::draftContextTokens),
+    require(states.metadata(0).lengths.targetTokens == 128 + decoded.outputTokens.size() &&
+                states.metadata(0).lengths.hasCompleteDraftWindow(executor.draftContextTokens()),
             "decode committed length mismatch");
 
     std::cout << "TOKENS";
@@ -8863,7 +8867,7 @@ int main(int argc, char **argv) {
         }
         stateLane = resume();
         const uint32_t length = static_cast<uint32_t>(sequence.prompt.size());
-        executor.setDraftContextPlan(sequence.id, planDraftContext(0, length, {}));
+        executor.setDraftContextPlan(sequence.id, planDraftContext(0, length, {}, executor.draftContextTokens()));
         if (repeatDuringReplay) {
           requireOpen(prefillChunk(executor, sequence.id, 0,
                                    std::span(sequence.prompt).first(32),
@@ -8875,7 +8879,7 @@ int main(int argc, char **argv) {
                   "repeated preemption retained its state buffers");
           requireLookupIndex(executor, sequence.id, {}, "a suspension during a replay");
           stateLane = resume();
-          executor.setDraftContextPlan(sequence.id, planDraftContext(0, length, {}));
+          executor.setDraftContextPlan(sequence.id, planDraftContext(0, length, {}, executor.draftContextTokens()));
         }
         ModelStepResult replay = prefillChunk(
             executor, sequence.id, 0, sequence.prompt, pageTable);
@@ -9170,8 +9174,8 @@ int main(int argc, char **argv) {
       for (uint32_t index = 0; index < prompt.size(); ++index)
         prompt[index] = samplingSeedTokens[index % samplingSeedTokens.size()];
       const std::array<uint32_t, 1> checkpoints{1024};
-      const DraftContextPlan plan = planDraftContext(
-          0, static_cast<uint32_t>(prompt.size()), checkpoints);
+      const DraftContextPlan plan =
+          planDraftContext(0, static_cast<uint32_t>(prompt.size()), checkpoints, executor.draftContextTokens());
       uint64_t capturedRows = 0;
       uint64_t resets = 0;
       for (const DraftCaptureSpan &span : plan.captureSpans) {
@@ -9237,7 +9241,7 @@ int main(int argc, char **argv) {
       require(!executor.beginRestore(93, 128, state, false, {}),
               "resident restore returned a read");
       executor.setDraftContextPlan(
-          93, planDraftContext(128, static_cast<uint32_t>(extended.size()), {}));
+          93, planDraftContext(128, static_cast<uint32_t>(extended.size()), {}, executor.draftContextTokens()));
       BatchPlan plan{.kind = WorkKind::Prefill,
                      .items = {{93, 100}},
                      .decodeStage = DecodeStage::Regular};

@@ -1378,7 +1378,8 @@ void testInkling(const std::filesystem::path &fixtures) {
            {test_gguf::uint32Key("dflash.vocab_size", 248320), "hidden size and vocabulary are not its target's"},
            {test_gguf::uint32Key("dflash.dspark.markov_rank", 128), "a Markov rank of 256"},
            {test_gguf::int32ArrayKey("dflash.target_layers", {5, 23, 41, 47}), "the last the target's final norm"},
-           {test_gguf::uint32Key("dflash.attention.sliding_window", 4096), "window lies inside its rings"},
+           {test_gguf::uint32Key("dflash.attention.sliding_window", 4096),
+            "sliding layers require an attention window below 2048"},
            {test_gguf::boolKey("dflash.attention.causal", true), "dflash.attention.causal 0"}})
     rejects([&] { static_cast<void>(drafted(dspark.with(refused.key))); }, refused.error,
             "a DSpark draft of another " + refused.key.name + " was accepted");
@@ -1407,6 +1408,14 @@ void testInkling(const std::filesystem::path &fixtures) {
               draft.attentionSize == 3072 && draft.contextKvSize() == 2048 && draft.projectionFormat == GGUF_FMT_Q80,
           "Inkling's DSpark layout does not read its taps or attend with its heads");
   const model::DraftStateLayout lane = draft.stateLayout();
+  require(draft.contextTokens() == 8192 && lane.contextTokens == 8192 && draft.attentionShape().contextTokens == 8192,
+          "DSpark must retain its 8K global context in rings, snapshots and "
+          "attention");
+  auto dflash = draft;
+  dflash.kind = model::DraftKind::DFlash2;
+  require(dflash.contextTokens() == 2048 && dflash.stateLayout().contextTokens == 2048 &&
+              dflash.attentionShape().contextTokens == 2048,
+          "DSpark's longer context changed DFlash2's 2K geometry");
   require(lane.contextWidth == 3 * 2304 && lane.auxiliaryBytes == 2304 * 2 && lane.valid(),
           "a DSpark lane does not keep its layers' context rows and its f_rnn row");
 }

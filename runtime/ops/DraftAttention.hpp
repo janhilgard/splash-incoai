@@ -17,6 +17,7 @@ struct DraftAttentionShape final {
   uint32_t queryHeads = 0;
   uint32_t kvHeads = 0;
   uint32_t headDimension = 0;
+  uint32_t contextTokens = SPLASH_DRAFT_SLIDING_WINDOW;
 
   bool operator==(const DraftAttentionShape &) const = default;
 };
@@ -138,29 +139,25 @@ public:
   // `width` values the slot's keys and values are computed from, in 4-bit
   // codes of 64-value groups with each group's fp16 scale and minimum
   // (metal/abi/DraftAttention.h). Positions map to slots as in the rings.
-  [[nodiscard]] static uint64_t contextWindowBytes(uint32_t width);
+  [[nodiscard]] static uint64_t contextWindowBytes(uint32_t width,
+                                                   uint32_t contextTokens = SPLASH_DRAFT_SLIDING_WINDOW);
   // Stores `rows` context rows in the slots of positions startPosition on.
-  static void addWindowStore(metal::CommandGraph &graph,
-                             metal::MetalBuffer context,
-                             metal::MetalBuffer window, uint32_t rows,
-                             uint32_t startPosition, uint32_t width);
+  static void addWindowStore(metal::CommandGraph &graph, metal::MetalBuffer context, metal::MetalBuffer window,
+                             uint32_t rows, uint32_t startPosition, uint32_t width,
+                             uint32_t contextTokens = SPLASH_DRAFT_SLIDING_WINDOW);
   // Stores the first `rows` (at most a verify block's) of the context rows a
   // lane retained of its rows of a decode step of `contextRows` context rows
   // (`retained`, its acceptance's mask of them, metal/abi/VerifyTree.h, among
   // its rows `laneRows`, SplashLaneRows), the path's i-th at position
   // startPosition + i, as addWindowStore does.
-  static void addWindowCommit(metal::CommandGraph &graph,
-                              metal::MetalBuffer context,
-                              metal::MetalBuffer window,
-                              metal::MetalBuffer retained,
-                              metal::MetalBuffer laneRows,
-                              uint32_t contextRows, uint32_t rows,
-                              uint32_t startPosition, uint32_t width);
+  static void addWindowCommit(metal::CommandGraph &graph, metal::MetalBuffer context, metal::MetalBuffer window,
+                              metal::MetalBuffer retained, metal::MetalBuffer laneRows, uint32_t contextRows,
+                              uint32_t rows, uint32_t startPosition, uint32_t width,
+                              uint32_t contextTokens = SPLASH_DRAFT_SLIDING_WINDOW);
   // Loads the rows of positions startPosition on back into `rows` rows.
-  static void addWindowLoad(metal::CommandGraph &graph,
-                            metal::MetalBuffer window,
-                            metal::MetalBuffer context, uint32_t rows,
-                            uint32_t startPosition, uint32_t width);
+  static void addWindowLoad(metal::CommandGraph &graph, metal::MetalBuffer window, metal::MetalBuffer context,
+                            uint32_t rows, uint32_t startPosition, uint32_t width,
+                            uint32_t contextTokens = SPLASH_DRAFT_SLIDING_WINDOW);
 };
 
 } // namespace splash::ops

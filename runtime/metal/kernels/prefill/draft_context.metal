@@ -25,7 +25,7 @@ prefill_draft_context_kv(device const bfloat *context_kv [[buffer(0)]],
   draft_context_kv_phase(context_kv + ulong(row) * RowWidth, k_norm,
                          rope_cos + ulong(row) * SPLASH_DRAFT_ROPE_PAIRS,
                          rope_sin + ulong(row) * SPLASH_DRAFT_ROPE_PAIRS, keys,
-                         values, params.start_position + row, task % KVHeads,
+                         values, params.start_position + row, task % KVHeads, params.ring_tokens,
                          thread_index, lane, simd_group, reductions,
                          normalized);
 }
@@ -59,7 +59,7 @@ prefill_draft_context_load(device const uchar *window [[buffer(0)]],
   if (!draft_context_group(params, threadgroup_index, simd_group, at))
     return;
   device const half2 *groups = reinterpret_cast<device const half2 *>(
-      window + draft_context_codes_bytes(params.width));
+      window + draft_context_codes_bytes(params.width, params.ring_tokens));
   const half2 group = groups[ulong(at.slot) * at.groups + at.group];
   const uchar byte = window[ulong(at.slot) * (params.width / 2) +
                             at.group * (SPLASH_DRAFT_CONTEXT_GROUP / 2) + lane];
