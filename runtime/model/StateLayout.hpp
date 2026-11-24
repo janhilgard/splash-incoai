@@ -101,7 +101,7 @@ struct GdnStateLayout final {
   bool operator==(const GdnStateLayout &) const = default;
 };
 
-// One ring of SPLASH_DRAFT_SLIDING_WINDOW slots per KV head for the keys and
+// One ring of contextTokens slots per KV head for the keys and
 // one for the values of every draft layer, and the context window the rings
 // are computed from: the draft's context row (contextWidth values) of each
 // slot, in 4-bit codes (metal/abi/DraftAttention.h). A lane's rings also hold
@@ -116,20 +116,20 @@ struct DraftStateLayout final {
   uint32_t headDimension = 0;
   uint32_t contextWidth = 0;
   uint32_t auxiliaryBytes = 0;
+  uint32_t contextTokens = SPLASH_DRAFT_SLIDING_WINDOW;
 
   [[nodiscard]] constexpr bool valid() const noexcept {
-    return layers && kvHeads && headDimension && contextWidth &&
-           contextWidth % SPLASH_DRAFT_CONTEXT_GROUP == 0;
+    return layers && kvHeads && headDimension && contextWidth && contextWidth % SPLASH_DRAFT_CONTEXT_GROUP == 0 &&
+           (contextTokens == SPLASH_DRAFT_SLIDING_WINDOW || contextTokens == SPLASH_DSPARK_CONTEXT_TOKENS);
   }
   [[nodiscard]] constexpr uint64_t tensorBytes() const noexcept {
-    return uint64_t{kvHeads} * SPLASH_DRAFT_SLIDING_WINDOW * headDimension *
-           bfloat16Bytes;
+    return uint64_t{kvHeads} * contextTokens * headDimension * bfloat16Bytes;
   }
   [[nodiscard]] constexpr uint64_t ringBytes() const noexcept {
     return uint64_t{layers} * 2 * tensorBytes() + auxiliaryBytes;
   }
   [[nodiscard]] constexpr uint64_t windowBytes() const noexcept {
-    return draft_context_window_bytes(contextWidth);
+    return draft_context_window_bytes(contextWidth, contextTokens);
   }
 
   bool operator==(const DraftStateLayout &) const = default;

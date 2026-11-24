@@ -16,9 +16,9 @@
 // restored lane rebuilds its rings, and the Markov head's context, the
 // f_rnn row of the lane's last position, beside its rings
 // (DFlashDraftRingLayer::auxiliary), which a prompt's last row and each
-// decode commit write. Its rings hold SPLASH_DRAFT_SLIDING_WINDOW positions:
+// decode commit write. Its rings hold 8,192 positions:
 // its windowed layers see the slidingWindow before the anchor as trained,
-// its global layer the ring's last SPLASH_DRAFT_SLIDING_WINDOW - 1.
+// its global layer the ring's last 8,191, reserving one slot for the anchor.
 //
 // A cycle's proposals are each lane's chain of the Markov head
 // (ops::DSpark::addMarkov), whose steps' top candidates and their logits

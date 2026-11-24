@@ -98,7 +98,7 @@ DFlashDraftLayout dsparkLayout(uint32_t hiddenSize, uint32_t vocabularySize, uin
     throw std::invalid_argument("DSpark kernels are compiled for a Markov rank of " +
                                 std::to_string(SPLASH_DSPARK_RANK));
   if (header.slidingLayers && (!header.slidingWindow || header.slidingWindow >= SPLASH_DRAFT_SLIDING_WINDOW))
-    throw std::invalid_argument("a DSpark draft's window lies inside its rings");
+    throw std::invalid_argument("DSpark sliding layers require an attention window below 2048 tokens");
   if (!header.proposedVocabulary || header.proposedVocabulary > vocabularySize || !(header.logitCap > 0))
     throw std::invalid_argument("a DSpark draft proposes tokens of its target's vocabulary at a positive cap");
   if (header.projectionFormat >= GGUF_FMT_COUNT)
@@ -272,10 +272,8 @@ void DFlashDraft::addContextRebuild(metal::CommandGraph &graph,
                                     const metal::MetalBuffer &window,
                                     std::span<const DFlashDraftRingLayer> ring,
                                     uint32_t rows, uint32_t startPosition) const {
-  static_assert(ExecutionLimits::draftContextTokens <= ExecutionLimits::prefillTokenBudget,
-                "a whole draft window passes through buffers of one prefill chunk's rows");
   const DFlashDraftLayout &layout = weights_.layout;
-  if (!rows || rows > ExecutionLimits::draftContextTokens || ring.size() != layout.layers)
+  if (!rows || rows > ExecutionLimits::prefillTokenBudget || ring.size() != layout.layers)
     throw std::invalid_argument("invalid draft context rebuild");
   ops::DraftAttention::addWindowLoad(graph, window, buffers.hidden, rows, startPosition,
                                      layout.hiddenSize);

@@ -573,7 +573,7 @@ std::string persistentCacheNamespace(const RuntimeCacheIdentity &identity,
   if (gdn.auxiliaryBytes) canonical << " auxiliary " << gdn.auxiliaryBytes;
   canonical << '\n'
             << "draft " << draft.layers << ' ' << draft.kvHeads << ' ' << draft.headDimension << ' '
-            << SPLASH_DRAFT_SLIDING_WINDOW << '\n'
+            << draft.contextTokens << '\n'
             << "context " << draft.contextWidth << " q4 " << SPLASH_DRAFT_CONTEXT_GROUP << '\n';
   // Without YaRN the line is left out, so the caches written before it
   // existed stay valid. The factor takes the digits that read back as the

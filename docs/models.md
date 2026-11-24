@@ -352,7 +352,9 @@ DSpark draft (`model/DSparkDraft.hpp`) runs a block of 8 rows, the anchor's
 token embedding normed as the target's and 7 mask rows, through 3 layers of
 24 query heads over 8 KV heads of 128 that attend non-causally within the
 block and to its context in rings: layers 0 and 2 the 1,024 positions before
-the anchor, layer 1 its ring's 2,047. Each layer's context row mixes four of
+the anchor, layer 1 its ring's 8,191 (the 8,192nd slot is reserved for the
+anchor). DFlash2 drafts keep their 2,048-slot rings. Each layer's context row
+mixes four of
 the target's rows (the outputs of its layers 4, 22 and 40 and its final
 normed row, which `InklingTarget` captures) by its own softmax weights and
 norm. Its rows' base logits are the target's head's; a Markov head over a
@@ -364,13 +366,22 @@ greedy lane's chain takes each position's most likely token; a sampled lane
 draws it from the position's 16 candidates at its temperature, and the target
 accepts its rows with min(1, p/q), so outputs keep the target's distribution.
 Its chain and the lane's host chain grow one tree (`DraftSelector::addChain`).
-Measured on an M3 Ultra (IQ4_NL target, 22G, one greedy lane), it decodes 1.6
-to 1.9 times as many tokens a second as Inkling without a draft on code (89 and
+Restoring a cached DSpark state rebuilds its rings in 2,048-row chunks, using
+the existing prefill scratch buffers. Cached states retain up to 8K positions;
+their disk-cache namespace includes the ring capacity, so older 2K states
+are not reused as 8K states. The larger draft takes memory that would
+otherwise hold target context; `--max-memory` still bounds the engine's
+memory plan.
+
+Earlier measurements with the 2K draft ring on an M3 Ultra (IQ4_NL target,
+22G, one greedy lane) decoded 1.6 to 1.9 times as many tokens a second as
+Inkling without a draft on code (89 and
 100 against 55 and 53) and 1.4 times on JSON, about as many on English prose
 (1.07 times) and fewer on Czech prose (0.83 times), whose draft rows the target
-accepts less often (1.4 tokens a cycle, against 2.0 to 3.6 on the others), so
-`--draft-model none` decodes such text faster. At 22G the automatic context is
-195,601 tokens with the draft and 232,465 without it.
+accepted less often (1.4 tokens a cycle, against 2.0 to 3.6 on the others).
+In those measurements, `--draft-model none` decoded Czech prose faster.
+At 22G the automatic context was 195,601 tokens with the 2K draft ring and
+232,465 without a draft.
 
 A DFlash2 draft's `config.json` states its layers, intermediate size, rotary base and
 the target layers whose outputs it reads (`dflash_config.target_layer_ids`,

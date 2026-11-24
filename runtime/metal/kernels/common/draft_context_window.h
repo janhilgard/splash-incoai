@@ -20,8 +20,7 @@ inline bool draft_context_group(constant DraftContextWindowParams &params,
   const uint task = threadgroup_index * SPLASH_DRAFT_CONTEXT_SIMDGROUPS + simd_group;
   result.row = task / result.groups;
   result.group = task % result.groups;
-  result.slot =
-      (params.start_position + result.row) % SPLASH_DRAFT_SLIDING_WINDOW;
+  result.slot = (params.start_position + result.row) & (params.ring_tokens - 1);
   return result.row < params.rows;
 }
 
@@ -46,8 +45,8 @@ inline void draft_context_store(device const bfloat *context, device uchar *wind
   codes[at.group * (SPLASH_DRAFT_CONTEXT_GROUP / 2) + lane] =
       uchar(code.x | (code.y << 4));
   if (lane == 0) {
-    device half2 *groups = reinterpret_cast<device half2 *>(
-        window + draft_context_codes_bytes(params.width));
+    device half2 *groups =
+        reinterpret_cast<device half2 *>(window + draft_context_codes_bytes(params.width, params.ring_tokens));
     groups[ulong(at.slot) * at.groups + at.group] = half2(scale, minimum);
   }
 }

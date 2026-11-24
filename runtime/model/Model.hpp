@@ -271,6 +271,7 @@ struct DraftBoundaryPlan final {
 struct DraftContextPlan final {
   uint32_t replayBegin = 0;
   uint32_t replayEnd = 0;
+  uint32_t windowTokens = SPLASH_DRAFT_SLIDING_WINDOW;
   std::vector<DraftCaptureSpan> captureSpans;
   std::vector<DraftBoundaryPlan> boundaries;
   // The first capture continues the restored draft ring: a non-zero replay
@@ -303,9 +304,9 @@ struct DispatchDraftCapturePlan final {
 
 // A replay from a non-zero boundary starts from the composite state restored
 // there.
-[[nodiscard]] DraftContextPlan
-planDraftContext(uint32_t replayBegin, uint32_t replayEnd,
-                 std::span<const uint32_t> materializationBoundaries);
+[[nodiscard]] DraftContextPlan planDraftContext(uint32_t replayBegin, uint32_t replayEnd,
+                                                std::span<const uint32_t> materializationBoundaries,
+                                                uint32_t windowTokens);
 
 [[nodiscard]] DispatchDraftCapturePlan
 draftCaptureSpansForDispatch(const DraftContextPlan &plan,
@@ -713,6 +714,9 @@ struct ExecutionLimits final {
 static_assert(ExecutionLimits::draftQueryRows ==
               ExecutionLimits::draftProposalTokens + 1);
 static_assert(ExecutionLimits::draftQueryRows <= ExecutionLimits::targetVerifyRows);
+static_assert(ExecutionLimits::draftContextTokens % kv::kPageTokens == 0 &&
+                  SPLASH_DSPARK_CONTEXT_TOKENS % kv::kPageTokens == 0,
+              "draft windows and their checkpoint intervals span whole KV pages");
 
 // The first rule a command breaks, or none: at most the runtime's
 // lanes; and for a prefill, pass `pass` of at most maximumPasses passes,
@@ -969,6 +973,8 @@ public:
   // The state bytes a lane's start allocates: the buffers the idle pool
   // lacks for its lane. Zero by default.
   [[nodiscard]] virtual uint64_t startStateBytes() const noexcept { return 0; }
+  // The retained draft history, independent of target prefill chunk size.
+  [[nodiscard]] virtual uint32_t draftContextTokens() const noexcept { return ExecutionLimits::draftContextTokens; }
   // What one prefill command may hold (commandViolation): by default a
   // chunk's rows in one pass over one layer, one lane past a chunk and no
   // lane whose history holds Index pages, as a model without readers of

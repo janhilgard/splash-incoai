@@ -19,16 +19,16 @@ namespace {
 using splash::test::rejects;
 using splash::test::require;
 
-DraftContextPlan activePlan(uint32_t replayBegin, uint32_t replayEnd) {
-  return planDraftContext(replayBegin, replayEnd, {});
+DraftContextPlan activePlan(uint32_t replayBegin, uint32_t replayEnd,
+                            uint32_t window = model::ExecutionLimits::draftContextTokens) {
+  return planDraftContext(replayBegin, replayEnd, {}, window);
 }
 
-DraftContextPlan
-cachedPlan(uint32_t replayBegin, uint32_t replayEnd,
-           std::initializer_list<uint32_t> materializationBoundaries) {
-  return planDraftContext(
-      replayBegin, replayEnd,
-      {materializationBoundaries.begin(), materializationBoundaries.size()});
+DraftContextPlan cachedPlan(uint32_t replayBegin, uint32_t replayEnd,
+                            std::initializer_list<uint32_t> materializationBoundaries,
+                            uint32_t window = model::ExecutionLimits::draftContextTokens) {
+  return planDraftContext(replayBegin, replayEnd, {materializationBoundaries.begin(), materializationBoundaries.size()},
+                          window);
 }
 
 // The rows a plan captures for the boundaries of one purpose.
@@ -50,14 +50,14 @@ uint32_t resets(const DraftContextPlan &plan) {
 }
 
 void testColdLengths() {
-  constexpr std::array<uint32_t, 12> lengths{0,  1,    7,    8,    31,   32,
-                                             33, 2047, 2048, 2049, 4096, 10000};
-  for (uint32_t length : lengths) {
-    const auto plan = activePlan(0, length);
-    require(draftContextRows(plan) == std::min<uint32_t>(length, 2048),
-            "cold draft window was not clipped to 2048 rows");
-    require(resets(plan) == (length ? 1U : 0U),
-            "cold draft state reset count is wrong");
+  for (uint32_t window : {SPLASH_DRAFT_SLIDING_WINDOW, SPLASH_DSPARK_CONTEXT_TOKENS}) {
+    const std::array<uint32_t, 12> lengths{0, 1, 7, 8, 31, 32, 33, window - 1, window, window + 1, 2 * window, 10000};
+    for (uint32_t length : lengths) {
+      const auto plan = activePlan(0, length, window);
+      require(draftContextRows(plan) == std::min(length, window),
+              "cold draft window was not clipped to its ring capacity");
+      require(resets(plan) == (length ? 1U : 0U), "cold draft state reset count is wrong");
+    }
   }
 }
 
@@ -241,40 +241,36 @@ void testSparseCheckpointWindowsAndShortResume() {
 }
 
 void testCheckpointWindowsAcrossSmallDispatches() {
-  const std::array plans{
-      cachedPlan(0, 12321, {4096, 8192, 12288, 12320}),
-      cachedPlan(8192, 14337, {8224, 10272, 14336}),
-      cachedPlan(0, 65, {32, 64}),
-  };
-  constexpr uint32_t window = model::ExecutionLimits::draftContextTokens;
-  for (const auto &plan : plans) {
-    for (uint32_t budget : {64U, 256U, 1376U, 2048U}) {
-      std::vector<uint32_t> state;
-      for (uint32_t row = plan.replayBegin - std::min(plan.replayBegin, window);
-           row < plan.replayBegin; ++row)
-        state.push_back(row);
+  for (uint32_t window : {SPLASH_DRAFT_SLIDING_WINDOW, SPLASH_DSPARK_CONTEXT_TOKENS}) {
+    const std::array plans{
+        cachedPlan(0, 12321, {4096, 8192, 12288, 12320}, window),
+        cachedPlan(8192, 14337, {8224, 10272, 14336}, window),
+        cachedPlan(0, 65, {32, 64}, window),
+    };
+    for (const auto &plan : plans) {
+      for (uint32_t budget : {64U, 256U, 1376U, 2048U}) {
+        std::vector<uint32_t> state;
+        for (uint32_t row = plan.replayBegin - std::min(plan.replayBegin, window); row < plan.replayBegin; ++row)
+          state.push_back(row);
 
-      uint32_t begin = plan.replayBegin;
-      for (const auto &boundary : plan.boundaries) {
-        while (begin < boundary.boundary) {
-          const uint32_t end = std::min(begin + budget, boundary.boundary);
-          for (const auto &capture : draftCaptureSpansForDispatch(plan, begin,
-                                                                end)) {
-            if (capture.resetDraftState)
-              state.clear();
-            for (uint32_t row = capture.absoluteBegin;
-                 row < capture.absoluteEnd; ++row)
-              state.push_back(row);
+        uint32_t begin = plan.replayBegin;
+        for (const auto &boundary : plan.boundaries) {
+          while (begin < boundary.boundary) {
+            const uint32_t end = std::min(begin + budget, boundary.boundary);
+            for (const auto &capture : draftCaptureSpansForDispatch(plan, begin, end)) {
+              if (capture.resetDraftState)
+                state.clear();
+              for (uint32_t row = capture.absoluteBegin; row < capture.absoluteEnd; ++row)
+                state.push_back(row);
+            }
+            begin = end;
           }
-          begin = end;
+          const uint32_t rows = std::min(boundary.boundary, window);
+          require(state.size() >= rows, "small dispatches dropped a checkpoint's draft context");
+          for (uint32_t row = 0; row < rows; ++row)
+            require(state[state.size() - rows + row] == boundary.boundary - rows + row,
+                    "checkpoint draft window contains stale or reordered rows");
         }
-        const uint32_t rows = std::min(boundary.boundary, window);
-        require(state.size() >= rows,
-                "small dispatches dropped a checkpoint's draft context");
-        for (uint32_t row = 0; row < rows; ++row)
-          require(state[state.size() - rows + row] ==
-                      boundary.boundary - rows + row,
-                  "checkpoint draft window contains stale or reordered rows");
       }
     }
   }
@@ -284,22 +280,30 @@ void testCheckpointWindowsAcrossSmallDispatches() {
 // does not reset it, exactly when its first boundary is within one window of
 // the restore; a cold plan restores none.
 void testRestoresDraftStateFlag() {
-  constexpr uint32_t window = model::ExecutionLimits::draftContextTokens;
-  for (const auto &[plan, restores] :
-       {std::pair{activePlan(4096, 4096 + window - 1), true},
-        std::pair{activePlan(4096, 4096 + window), false},
-        std::pair{cachedPlan(4096, 9000, {4096 + window - 1}), true},
-        std::pair{cachedPlan(4096, 9000, {4096 + window}), false}}) {
-    require(plan.restoresDraftState == restores &&
-                plan.captureSpans.front().resetDraftState == !restores,
-            "restored plan misjudged whether its draft ring continues");
+  for (uint32_t window : {SPLASH_DRAFT_SLIDING_WINDOW, SPLASH_DSPARK_CONTEXT_TOKENS}) {
+    for (const auto &[plan, restores] :
+         {std::pair{activePlan(4096, 4096 + window - 1, window), true},
+          std::pair{activePlan(4096, 4096 + window, window), false},
+          std::pair{cachedPlan(4096, 4096 + 2 * window, {4096 + window - 1}, window), true},
+          std::pair{cachedPlan(4096, 4096 + 2 * window, {4096 + window}, window), false}}) {
+      require(plan.restoresDraftState == restores && plan.captureSpans.front().resetDraftState == !restores,
+              "restored plan misjudged whether its draft ring continues");
+    }
+    for (const auto &plan :
+         {activePlan(0, 1, window), activePlan(0, window - 1, window), cachedPlan(0, 3 * window, {window}, window)})
+      require(!plan.restoresDraftState, "cold plan claimed a restored draft ring");
   }
-  for (const auto &plan : {activePlan(0, 1), activePlan(0, window - 1),
-                           cachedPlan(0, 3 * window, {window})})
-    require(!plan.restoresDraftState, "cold plan claimed a restored draft ring");
 }
 
 void testInvalidInputs() {
+  rejects([] { (void)activePlan(0, 4096, 1024); },
+          "draft context must be a power of two at least as large as a prefill "
+          "chunk",
+          "a draft window smaller than a prefill chunk was accepted");
+  rejects([] { (void)activePlan(0, 4096, 3072); },
+          "draft context must be a power of two at least as large as a prefill "
+          "chunk",
+          "a non-power-of-two draft ring was accepted");
   const auto plan = activePlan(0, 4096);
   rejects([&] { (void)draftCaptureSpansForDispatch(plan, 0, 2049); },
           "invalid target-prefill dispatch range", "oversized dispatch was accepted");

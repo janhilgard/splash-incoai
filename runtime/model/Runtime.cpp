@@ -1406,16 +1406,14 @@ struct Runtime::Impl {
   // capture also keeps the rows' context in the window (`windowed`), which
   // stays current if it was, and so does a decode commit where decode
   // captures states (capturesInDecode); other decode commits leave it behind.
-  static QwenLogicalLengths
-  advanceDraftContext(const QwenLogicalLengths &previous, uint64_t targetTokens,
-                      uint64_t begin, uint64_t end, bool reset, bool windowed) {
+  QwenLogicalLengths advanceDraftContext(const QwenLogicalLengths &previous, uint64_t targetTokens, uint64_t begin,
+                                         uint64_t end, bool reset, bool windowed) const {
     if (!reset && (!previous.draftLength || previous.draftEnd() != begin))
       throw std::logic_error("draft capture does not continue the draft ring");
     const uint64_t combined = (reset ? 0 : previous.draftLength) + (end - begin);
     QwenLogicalLengths next = previous;
     next.targetTokens = targetTokens;
-    next.draftLength =
-        static_cast<uint32_t>(std::min<uint64_t>(combined, kDraftCacheStride));
+    next.draftLength = static_cast<uint32_t>(std::min<uint64_t>(combined, geometry.draft.contextTokens()));
     next.draftBase = end - next.draftLength;
     if (windowed && (reset || previous.hasCurrentContextWindow()))
       next.windowEnd = end;
@@ -2021,11 +2019,16 @@ struct Runtime::Impl {
     if (!draftModel)
       return;
     auto p = [&](PrefillTensor tensor) { return prefillArena->get(tensor, 0); };
-    ops::RoPE::addDraftRangeTables(graph, p(PrefillTensor::DraftInverseFrequencies),
-                                   p(PrefillTensor::DraftRopeCos), p(PrefillTensor::DraftRopeSin),
-                                   rebuild.rows, rebuild.begin, kPrefillRows);
-    draftModel->addContextRebuild(graph, draftPrefillBuffers(*prefillArena, 0), states.window(lane),
-                                  states.draft(lane), rebuild.rows, rebuild.begin);
+    // The saved window can exceed one prefill chunk. Reuse its scratch and
+    // RoPE tables in order, preserving absolute positions in the ring.
+    for (uint32_t offset = 0; offset < rebuild.rows; offset += kPrefillRows) {
+      const uint32_t rows = std::min(kPrefillRows, rebuild.rows - offset);
+      const uint32_t begin = rebuild.begin + offset;
+      ops::RoPE::addDraftRangeTables(graph, p(PrefillTensor::DraftInverseFrequencies), p(PrefillTensor::DraftRopeCos),
+                                     p(PrefillTensor::DraftRopeSin), rows, begin, kPrefillRows);
+      draftModel->addContextRebuild(graph, draftPrefillBuffers(*prefillArena, 0), states.window(lane),
+                                    states.draft(lane), rows, begin);
+    }
   }
 
   // Creates the pipelines of a draft rebuild of `rows` on `lane` without
@@ -2383,7 +2386,7 @@ struct Runtime::Impl {
     }
     const QwenLaneMetadata &metadata = states.metadata(entry.stateLane);
     if (metadata.lengths.targetTokens != item.logicalPosition ||
-        !metadata.lengths.hasCompleteDraftWindow(kDraftCacheStride)) {
+        !metadata.lengths.hasCompleteDraftWindow(geometry.draft.contextTokens())) {
       throw std::logic_error("decode state length is not exact");
     }
     // The target reads the history before the pending token from the
@@ -3489,9 +3492,8 @@ void Runtime::beginColdRequest(const ModelRequest &request,
         admission.allocationFailure);
   }
   try {
-    setDraftContextPlan(
-        request.id,
-        planDraftContext(0, static_cast<uint32_t>(request.prompt.size()), {}));
+    setDraftContextPlan(request.id,
+                        planDraftContext(0, static_cast<uint32_t>(request.prompt.size()), {}, draftContextTokens()));
   } catch (...) {
     end(request.id);
     throw;
@@ -3614,8 +3616,7 @@ void Runtime::finishRestore(uint64_t requestId, uint32_t restoredPrefixLength,
   const QwenLogicalLengths &lengths =
       impl_->states.metadata(entry.stateLane).lengths;
   if (lengths.targetTokens != restoredPrefixLength ||
-      (restoreDraftState &&
-       !lengths.hasCompleteDraftWindow(kDraftCacheStride)) ||
+      (restoreDraftState && !lengths.hasCompleteDraftWindow(impl_->geometry.draft.contextTokens())) ||
       (!restoreDraftState && lengths.draftLength != 0)) {
     throw std::invalid_argument("prefix logical length does not match state");
   }
@@ -3643,7 +3644,7 @@ void Runtime::finishRestore(uint64_t requestId, uint32_t restoredPrefixLength,
 
 void Runtime::setDraftContextPlan(uint64_t requestId, DraftContextPlan plan) {
   Impl::Request &entry = impl_->request(requestId);
-  if (!entry.resident || plan.replayEnd != entry.promptTokens) {
+  if (!entry.resident || plan.replayEnd != entry.promptTokens || plan.windowTokens != draftContextTokens()) {
     throw std::invalid_argument("draft context plan does not match request");
   }
   const uint64_t current =
@@ -3820,9 +3821,7 @@ Runtime::prefillAsync(const BatchPlan &plan,
       QwenLogicalLengths lengths = impl->states.metadata(entry.stateLane).lengths;
       lengths.targetTokens = nextLength;
       for (const DispatchDraftCaptureSpan &capture : outputs.captures[lane]) {
-        lengths = Impl::advanceDraftContext(lengths, nextLength,
-                                            capture.absoluteBegin,
-                                            capture.absoluteEnd,
+        lengths = impl->advanceDraftContext(lengths, nextLength, capture.absoluteBegin, capture.absoluteEnd,
                                             capture.resetDraftState, true);
         impl->counters.draftContextRowsActive += capture.activeRows;
         impl->counters.draftContextRowsMaterialization +=
@@ -4167,6 +4166,7 @@ Runtime::snapshotToDisk(uint64_t requestId, std::function<void()> completion) {
 }
 
 CommandLimits Runtime::commandLimits() const noexcept { return impl_->limits; }
+uint32_t Runtime::draftContextTokens() const noexcept { return impl_->geometry.draft.contextTokens(); }
 
 CommandWork Runtime::prefillWork(std::span<const PrefillLane> lanes, uint32_t first, uint32_t passesLeft) const {
   return impl_->prefillWork(lanes, first, passesLeft);
@@ -4377,7 +4377,7 @@ WarmupStepResult Runtime::warmupPrefill(uint32_t rows) {
     // as a 16 GB Mac's is: so each prefill warmup creates the rebuild's
     // pipelines on its lane. Without them the 35B's first cached prefix on
     // the 10-core M4 created two, 15 ms cold.
-    impl_->prepareDraftRebuild(0, std::min(rows, ExecutionLimits::draftContextTokens));
+    impl_->prepareDraftRebuild(0, std::min(rows, draftContextTokens()));
     // No warmup captures a state inside its chunk, as a prompt does at a
     // cached boundary inside one: Flash-Next's first such request created
     // ngram_embedding_history while serving (0.6 ms warm on the 48 GB
@@ -4551,12 +4551,10 @@ WarmupStepResult Runtime::warmupDecodeBatch(uint32_t width) {
     bool committedEveryLane = decoded.size() == width;
     for (uint32_t lane = 0; committedEveryLane && lane < width; ++lane) {
       const auto &lengths = impl_->states.metadata(stateLane(lane)).lengths;
-      committedEveryLane = !decoded[lane].outputTokens.empty() &&
-                           lengths.targetTokens > 1 &&
-                           lengths.targetTokens ==
-                               1 + decoded[lane].outputTokens.size() -
-                                   decoded[lane].outputTokensWithoutKv &&
-                           lengths.hasCompleteDraftWindow(kDraftCacheStride);
+      committedEveryLane =
+          !decoded[lane].outputTokens.empty() && lengths.targetTokens > 1 &&
+          lengths.targetTokens == 1 + decoded[lane].outputTokens.size() - decoded[lane].outputTokensWithoutKv &&
+          lengths.hasCompleteDraftWindow(impl_->geometry.draft.contextTokens());
     }
     if (!committedEveryLane) {
       throw std::runtime_error(
@@ -4677,10 +4675,10 @@ WarmupStepResult Runtime::warmupCompositeStateRestore() {
     beginColdRequest(request, restoredLane);
     if (beginRestore(id, prefixTokens, cachedState, true, {}))
       throw std::logic_error("a resident state restore returned a read");
-    setDraftContextPlan(id, planDraftContext(prefixTokens, promptTokens, {}));
+    setDraftContextPlan(id, planDraftContext(prefixTokens, promptTokens, {}, draftContextTokens()));
     const auto &restored = impl_->states.metadata(restoredLane).lengths;
     if (restored.targetTokens != prefixTokens ||
-        !restored.hasCompleteDraftWindow(kDraftCacheStride)) {
+        !restored.hasCompleteDraftWindow(impl_->geometry.draft.contextTokens())) {
       throw std::runtime_error("prefix restore length mismatch");
     }
 
@@ -4711,11 +4709,9 @@ WarmupStepResult Runtime::warmupCompositeStateRestore() {
     wallSeconds += historicalDecodeWallSeconds;
     const auto &continued = impl_->states.metadata(restoredLane).lengths;
     if (decoded.size() != 1 || decoded[0].outputTokens.empty() ||
-        !continued.hasCompleteDraftWindow(kDraftCacheStride) ||
+        !continued.hasCompleteDraftWindow(impl_->geometry.draft.contextTokens()) ||
         continued.targetTokens <= promptTokens ||
-        continued.targetTokens !=
-            promptTokens + decoded[0].outputTokens.size() -
-                decoded[0].outputTokensWithoutKv) {
+        continued.targetTokens != promptTokens + decoded[0].outputTokens.size() - decoded[0].outputTokensWithoutKv) {
       throw std::runtime_error(
           "restored historical prefix did not continue exactly");
     }

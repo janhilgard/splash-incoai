@@ -7,16 +7,15 @@
 // values (KWidth each), at `source`, and its RoPE rows. The keys are
 // normalized and rotated into the ring slot of the position; the values are
 // copied there.
-inline void draft_context_kv_phase(
-    device const bfloat *source, device const bfloat *k_norm,
-    device const float *rope_cos, device const float *rope_sin,
-    device bfloat *keys, device bfloat *values, uint position,
-    uint head_index, uint thread_index, uint lane, uint simd_group,
-    threadgroup float *reductions, threadgroup bfloat *normalized) {
-  constexpr uint HeadDim = SPLASH_DRAFT_HEAD_DIMENSION,
-                 Window = SPLASH_DRAFT_SLIDING_WINDOW;
+inline void draft_context_kv_phase(device const bfloat *source, device const bfloat *k_norm,
+                                   device const float *rope_cos, device const float *rope_sin, device bfloat *keys,
+                                   device bfloat *values, uint position, uint head_index, uint ring_tokens,
+                                   uint thread_index, uint lane, uint simd_group, threadgroup float *reductions,
+                                   threadgroup bfloat *normalized) {
+  constexpr uint HeadDim = SPLASH_DRAFT_HEAD_DIMENSION;
+  const uint Window = ring_tokens;
   constexpr uint KWidth = SPLASH_DRAFT_KV_HEADS * HeadDim;
-  uint slot = position % Window;
+  uint slot = position & (Window - 1);
   source += head_index * HeadDim;
   device bfloat *key = keys + (ulong(head_index) * Window + slot) * HeadDim;
   device bfloat *value = values + ulong(head_index) * HeadDim * Window + slot;

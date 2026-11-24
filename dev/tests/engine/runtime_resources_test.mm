@@ -503,6 +503,10 @@ void testPersistentCacheNamespace() {
           "the build changed the cache namespace");
   model::CompositeStateLayout states = model.stateLayout, bfloatStates = model.stateLayout;
   ++states.draft.layers;
+  auto wider = model.stateLayout;
+  wider.draft.contextTokens = SPLASH_DSPARK_CONTEXT_TOKENS;
+  require(persistentCacheNamespace(identity('a', "build", kv::Format::Int8), wider) != name,
+          "different draft ring capacities shared a persistent cache namespace");
   bfloatStates.target.format = ops::GdnStateFormat::BFloat16;
   require(persistentCacheNamespace(identity('c', "build", kv::Format::Int8), model.stateLayout) !=
                   name &&

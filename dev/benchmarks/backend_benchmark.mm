@@ -1354,8 +1354,8 @@ int main(int argc, char **argv) {
         }
         continuationResult.coldOutputMatch =
             continuationResult.outputTokens == continuationCold.outputTokens;
-        if (coldResult.draftContextRows != expectedDraftContextRows(
-                length, engine::kPrefillCheckpointTokens)) {
+        if (coldResult.draftContextRows !=
+            expectedDraftContextRows(length, 2 * executor->draftContextTokens(), 0, executor->draftContextTokens())) {
           throw std::runtime_error(
               "cold prefill performed unnecessary draft-context work");
         }
@@ -1401,12 +1401,11 @@ int main(int argc, char **argv) {
             ((partialBase.size() - 1) / kv::kPageTokens) *
             kv::kPageTokens;
         const uint64_t expectedPartialRows = expectedDraftContextRows(
-            partialPrompt.size(), engine::kPrefillCheckpointTokens,
-            partialBoundary);
-        if (partialSeed.cacheStatus != "miss" ||
-            partialHit.cacheStatus != "prefix_hit" ||
+            partialPrompt.size(), 2 * executor->draftContextTokens(), partialBoundary, executor->draftContextTokens());
+        if (partialSeed.cacheStatus != "miss" || partialHit.cacheStatus != "prefix_hit" ||
             partialHit.matchedTokens != partialBoundary ||
-            partialHit.draftStateRestoreSkipped != 1 ||
+            partialHit.draftStateRestoreSkipped !=
+                uint64_t{partialPrompt.size() - partialBoundary >= executor->draftContextTokens()} ||
             partialHit.draftContextRows != expectedPartialRows) {
           throw std::runtime_error(
               "4K partial-hit draft-window oracle failed: seed_status=" +
